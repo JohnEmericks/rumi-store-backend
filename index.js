@@ -836,6 +836,9 @@ app.post("/chat", async (req, res) => {
         "- Keep answers short and easy to scan in a small chat window.\n" +
         "- Prefer 1–2 short sentences followed by a simple bullet list when it makes sense.\n" +
         "- Use Markdown: **bold** for important words or product names, and line breaks between paragraphs or list items.\n" +
+        "- Do NOT use Markdown image syntax (no `![](url)`) and do NOT use horizontal rules (`---`).\n" +
+        "- When recommending products, suggest at most 2 specific products at a time, as a bullet list with name and a very short description (optionally mention the SKU once).\n" +
+        "- Avoid repeating the same product name or SKU multiple times in the same answer.\n" +
         "- Avoid long blocks of text; split information into multiple lines.",
     });
 
