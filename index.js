@@ -18,26 +18,14 @@ const pool = new Pool({
 
 async function initDb() {
   try {
-    // 1) stores-tabell
+    // 1) stores-tabell (grund)
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS store_items (
+      CREATE TABLE IF NOT EXISTS stores (
         id SERIAL PRIMARY KEY,
-        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-        external_id TEXT NOT NULL,
-        type TEXT NOT NULL,
-        title TEXT,
-        url TEXT,
-        image_url TEXT,
-        content TEXT,
-        embedding DOUBLE PRECISION[],
-        UNIQUE (store_id, external_id, type)
+        store_id TEXT UNIQUE NOT NULL,
+        api_key TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT now()
       );
-    `);
-
-    // Säkerställ image_url-kolumnen även om tabellen fanns sedan tidigare
-    await pool.query(`
-      ALTER TABLE store_items
-      ADD COLUMN IF NOT EXISTS image_url TEXT;
     `);
 
     // Säkerställ att nya kolumner finns även om tabellen fanns sedan tidigare
@@ -69,10 +57,17 @@ async function initDb() {
         type TEXT NOT NULL,
         title TEXT,
         url TEXT,
+        image_url TEXT,
         content TEXT,
         embedding DOUBLE PRECISION[],
         UNIQUE (store_id, external_id, type)
       );
+    `);
+
+    // Säkerställ att image_url finns även om tabellen är gammal
+    await pool.query(`
+      ALTER TABLE store_items
+      ADD COLUMN IF NOT EXISTS image_url TEXT;
     `);
 
     // 3) store_facts-tabell (generiska fakta som e-post, telefon, etc.)
@@ -228,12 +223,7 @@ function extractFactsFromText(text) {
   const facts = [];
   if (!text || typeof text !== "string") return facts;
 
-  // Dela upp i rader för att kunna se block som "Kontakt", "Adress" osv.
-  const lines = text
-    .split(/\r?\n+/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-  const fullText = text; // behåller originalet för vissa regexar
+  const fullText = text;
 
   // 1) E-postadresser (i hela texten)
   {
@@ -501,7 +491,7 @@ app.post("/index-store", async (req, res) => {
     // 3) Call OpenAI embeddings
     const vectors = await embedTexts(texts);
 
-    // 4) Combine items + vectors into embedding records
+    // 4) Combine items + vectors into embedding records + koppla title/url/image_url
     const embeddedItems = items.map((item, idx) => {
       let title = "";
       let url = "";
@@ -799,6 +789,24 @@ app.post("/chat", async (req, res) => {
     }
     const lowConfidence = maxScore < RELEVANCE_THRESHOLD;
 
+    // Produktkort: max 2 relevanta produkter med URL och bild
+    const PRODUCT_CARD_THRESHOLD = 0.4;
+    const productCards = top
+      .filter(
+        (entry) =>
+          entry.item.type === "product" &&
+          entry.item.url &&
+          entry.item.image_url &&
+          entry.score >= PRODUCT_CARD_THRESHOLD
+      )
+      .slice(0, 2)
+      .map((entry) => ({
+        title: entry.item.title || "Visa produkt",
+        url: entry.item.url,
+        image_url: entry.item.image_url,
+        score: entry.score,
+      }));
+
     // 5) Bygg context-strängen från toppträffarna (med trimming)
     const contextParts = top.map((entry, index) => {
       const { item, score } = entry;
@@ -926,6 +934,7 @@ app.post("/chat", async (req, res) => {
       })),
       max_relevance_score: maxScore,
       low_confidence: lowConfidence,
+      product_cards: productCards,
     });
   } catch (err) {
     console.error("Error in /chat:", err);
