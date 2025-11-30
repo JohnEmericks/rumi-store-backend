@@ -624,6 +624,14 @@ app.post("/index-store", async (req, res) => {
   }
 });
 
+// Explicit CORS preflight handler for /chat
+app.options("/chat", (req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  return res.sendStatus(200);
+});
+
 // POST /chat
 app.post("/chat", async (req, res) => {
   const body = req.body || {};
