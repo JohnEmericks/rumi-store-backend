@@ -759,7 +759,7 @@ app.post("/chat", async (req, res) => {
     }
   }
 
-  // Om vi fortfarande inte har embeddings -> fel som tidigare
+  // Om vi fortfarande inte har embeddings -> fel
   if (
     !storeData ||
     !Array.isArray(storeData.items) ||
@@ -787,9 +787,20 @@ app.post("/chat", async (req, res) => {
     const TOP_N = 5;
     const MAX_SNIPPET_CHARS = 1000;
     const RELEVANCE_THRESHOLD = 0.3;
-    // Bygg produktkort för frontend – topp-produkter med bra score
-    const PRODUCT_CARD_THRESHOLD = 0.4;
 
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, TOP_N);
+
+    let maxScore = -1;
+    for (const entry of top) {
+      if (entry.score > maxScore) {
+        maxScore = entry.score;
+      }
+    }
+    const lowConfidence = maxScore < RELEVANCE_THRESHOLD;
+
+    // 4b) Bygg produktkort baserat på toppträffarna
+    const PRODUCT_CARD_THRESHOLD = 0.4;
     const productCards = top
       .filter(
         (entry) =>
@@ -804,17 +815,6 @@ app.post("/chat", async (req, res) => {
         image_url: entry.item.image_url || null,
         score: entry.score,
       }));
-
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, TOP_N);
-
-    let maxScore = -1;
-    for (const entry of top) {
-      if (entry.score > maxScore) {
-        maxScore = entry.score;
-      }
-    }
-    const lowConfidence = maxScore < RELEVANCE_THRESHOLD;
 
     // 5) Build a context string from the top items (med trimming)
     const contextParts = top.map((entry, index) => {
@@ -840,7 +840,7 @@ app.post("/chat", async (req, res) => {
 
     const messages = [];
 
-    // 1) System – den korta prompten ovan
+    // 1) System-prompt
     messages.push({
       role: "system",
       content:
@@ -879,7 +879,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // 3) Lägg in verified facts (adress / telefon / email) som ett helt vanligt assistant-svar
+    // 3) Lägg in verified facts (adress / telefon / email)
     if (factsContext) {
       messages.push({
         role: "assistant",
@@ -887,7 +887,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // 4) Lägg in RAG-contexten, med en liten hint om hur säker matchningen är
+    // 4) Lägg in RAG-contexten, med en hint om hur säker matchningen är
     let ragIntro;
     if (!top.length || lowConfidence) {
       ragIntro =
@@ -903,7 +903,7 @@ app.post("/chat", async (req, res) => {
       content: ragIntro + "\n\n" + (context || "(ingen ytterligare kontext)"),
     });
 
-    // 5) Till sist: användarens fråga – men undvik att lägga till den två gånger
+    // 5) Till sist: användarens fråga – undvik duplikat
     let shouldAppendUserMessage = true;
     if (sanitizedHistory.length > 0) {
       const last = sanitizedHistory[sanitizedHistory.length - 1];
