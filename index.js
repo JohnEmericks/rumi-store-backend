@@ -1,7 +1,6 @@
 const express = require("express");
 require("dotenv").config();
 const OpenAI = require("openai");
-const cors = require("cors");
 const { Pool } = require("pg");
 const crypto = require("crypto");
 
@@ -87,41 +86,19 @@ async function initDb() {
   }
 }
 
-const allowedOrigins = [
-  "https://layo.se",
-  "https://www.layo.se",
-  "https://dev.webbexpress.se",
-  "https://www.dev.webbexpress.se",
-  "http://localhost:8000",
-  "http://localhost:3000",
-];
+// Very open CORS for MVP – allow all origins and handle preflight
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
 
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow non-browser tools (no origin) like curl/Postman
-    if (!origin) {
-      return callback(null, true);
-    }
+  if (req.method === "OPTIONS") {
+    // Preflight request – no body, just OK
+    return res.sendStatus(200);
+  }
 
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      // Allowed origin
-      return callback(null, true);
-    } else {
-      // Not allowed – for now we just deny silently
-      console.warn("Blocked CORS origin:", origin);
-      return callback(null, false);
-    }
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-};
-
-// CORS måste komma FÖRE alla routes
-app.use(cors(corsOptions));
-// Hantera preflight globalt
-app.options("*", cors(corsOptions));
-
-app.use(express.json({ limit: "10mb" }));
+  next();
+});
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
