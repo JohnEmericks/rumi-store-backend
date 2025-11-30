@@ -759,7 +759,7 @@ app.post("/chat", async (req, res) => {
     }
   }
 
-  // Om vi fortfarande inte har embeddings -> fel
+  // Om vi fortfarande inte har embeddings -> fel som tidigare
   if (
     !storeData ||
     !Array.isArray(storeData.items) ||
@@ -799,24 +799,7 @@ app.post("/chat", async (req, res) => {
     }
     const lowConfidence = maxScore < RELEVANCE_THRESHOLD;
 
-    // 4b) Bygg produktkort baserat på toppträffarna
-    const PRODUCT_CARD_THRESHOLD = 0.4;
-    const productCards = top
-      .filter(
-        (entry) =>
-          entry.item.type === "product" &&
-          entry.item.url &&
-          entry.score >= PRODUCT_CARD_THRESHOLD
-      )
-      .slice(0, 3)
-      .map((entry) => ({
-        title: entry.item.title || "Visa produkt",
-        url: entry.item.url,
-        image_url: entry.item.image_url || null,
-        score: entry.score,
-      }));
-
-    // 5) Build a context string from the top items (med trimming)
+    // 5) Bygg context-strängen från toppträffarna (med trimming)
     const contextParts = top.map((entry, index) => {
       const { item, score } = entry;
 
@@ -830,9 +813,9 @@ app.post("/chat", async (req, res) => {
         `Type: ${item.type}`,
         `Item ID: ${item.item_id}`,
         `Relevance score: ${score.toFixed(4)}`,
-        ``,
+        "",
         snippet,
-        ``,
+        "",
       ].join("\n");
     });
 
@@ -840,7 +823,7 @@ app.post("/chat", async (req, res) => {
 
     const messages = [];
 
-    // 1) System-prompt
+    // 1) System – stil och beteende
     messages.push({
       role: "system",
       content:
@@ -856,7 +839,7 @@ app.post("/chat", async (req, res) => {
         "- Avoid long blocks of text; split information into multiple lines.",
     });
 
-    // 2) Tidigare chatt-historik – sanera och undvik dubletter
+    // 2) Historia – rensa och lägg till
     const sanitizedHistory = [];
     if (Array.isArray(history)) {
       history.forEach((msg) => {
@@ -879,7 +862,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // 3) Lägg in verified facts (adress / telefon / email)
+    // 3) Lägg in fakta-biten som assistant-svar
     if (factsContext) {
       messages.push({
         role: "assistant",
@@ -887,7 +870,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // 4) Lägg in RAG-contexten, med en hint om hur säker matchningen är
+    // 4) Lägg in RAG-context med info om säkerhet
     let ragIntro;
     if (!top.length || lowConfidence) {
       ragIntro =
@@ -903,7 +886,7 @@ app.post("/chat", async (req, res) => {
       content: ragIntro + "\n\n" + (context || "(ingen ytterligare kontext)"),
     });
 
-    // 5) Till sist: användarens fråga – undvik duplikat
+    // 5) Till sist: lägg till användarens fråga (utan dublett)
     let shouldAppendUserMessage = true;
     if (sanitizedHistory.length > 0) {
       const last = sanitizedHistory[sanitizedHistory.length - 1];
@@ -940,7 +923,6 @@ app.post("/chat", async (req, res) => {
       })),
       max_relevance_score: maxScore,
       low_confidence: lowConfidence,
-      product_cards: productCards,
     });
   } catch (err) {
     console.error("Error in /chat:", err);
