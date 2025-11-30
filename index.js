@@ -20,15 +20,24 @@ async function initDb() {
   try {
     // 1) stores-tabell
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS stores (
+      CREATE TABLE IF NOT EXISTS store_items (
         id SERIAL PRIMARY KEY,
-        store_id TEXT UNIQUE NOT NULL,
-        api_key TEXT NOT NULL,
-        site_url TEXT,
-        store_name TEXT,
-        admin_email TEXT,
-        created_at TIMESTAMPTZ DEFAULT now()
+        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        external_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT,
+        url TEXT,
+        image_url TEXT,
+        content TEXT,
+        embedding DOUBLE PRECISION[],
+        UNIQUE (store_id, external_id, type)
       );
+    `);
+
+    // Säkerställ image_url-kolumnen även om tabellen fanns sedan tidigare
+    await pool.query(`
+      ALTER TABLE store_items
+      ADD COLUMN IF NOT EXISTS image_url TEXT;
     `);
 
     // Säkerställ att nya kolumner finns även om tabellen fanns sedan tidigare
@@ -373,7 +382,7 @@ async function loadStoreDataFromDb(storeIdString) {
     // 2) Hämta alla items för den butiken
     const itemsRes = await pool.query(
       `
-      SELECT external_id, type, title, url, content, embedding
+      SELECT external_id, type, title, url, image_url, content, embedding
       FROM store_items
       WHERE store_id = $1
       `,
@@ -389,7 +398,10 @@ async function loadStoreDataFromDb(storeIdString) {
       type: row.type,
       item_id: row.external_id,
       text: row.content || row.title || "",
-      embedding: row.embedding, // DOUBLE PRECISION[] -> JS-array
+      embedding: row.embedding,
+      title: row.title || "",
+      url: row.url || "",
+      image_url: row.image_url || "",
     }));
 
     return { items };
@@ -490,13 +502,43 @@ app.post("/index-store", async (req, res) => {
     const vectors = await embedTexts(texts);
 
     // 4) Combine items + vectors into embedding records
-    const embeddedItems = items.map((item, idx) => ({
-      type: item.type,
-      item_id: item.item_id,
-      base_id: item.base_id || null,
-      text: item.text,
-      embedding: vectors[idx],
-    }));
+    const embeddedItems = items.map((item, idx) => {
+      let title = "";
+      let url = "";
+      let imageUrl = "";
+
+      if (item.type === "product") {
+        const lookupId = item.base_id || item.item_id;
+        const p = (products || []).find(
+          (prod) => String(prod.id) === String(lookupId)
+        );
+        if (p) {
+          title = p.title || "";
+          url = p.url || "";
+          imageUrl = p.image_url || "";
+        }
+      } else if (item.type === "page") {
+        const lookupId = item.base_id || item.item_id;
+        const pg = (pages || []).find(
+          (page) => String(page.id) === String(lookupId)
+        );
+        if (pg) {
+          title = pg.title || "";
+          url = pg.url || "";
+        }
+      }
+
+      return {
+        type: item.type,
+        item_id: item.item_id,
+        base_id: item.base_id || null,
+        text: item.text,
+        embedding: vectors[idx],
+        title,
+        url,
+        image_url: imageUrl,
+      };
+    });
 
     // 5) Store in memory as our "vector DB"
     storeEmbeddings[store_id] = {
@@ -539,47 +581,30 @@ app.post("/index-store", async (req, res) => {
         };
 
         for (const item of embeddedItems) {
-          let title = "";
-          let url = "";
-
-          if (item.type === "product") {
-            const lookupId = item.base_id || item.item_id;
-            const p = (products || []).find(
-              (prod) => String(prod.id) === String(lookupId)
-            );
-            if (p) {
-              title = p.title || "";
-              url = p.url || "";
-            }
-          } else if (item.type === "page") {
-            const lookupId = item.base_id || item.item_id;
-            const pg = (pages || []).find(
-              (page) => String(page.id) === String(lookupId)
-            );
-            if (pg) {
-              title = pg.title || "";
-              url = pg.url || "";
-            }
-          }
+          const title = item.title || "";
+          const url = item.url || "";
+          const imageUrl = item.image_url || "";
 
           const itemRes = await pool.query(
             `
-            INSERT INTO store_items (store_id, external_id, type, title, url, content, embedding)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO store_items (store_id, external_id, type, title, url, image_url, content, embedding)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (store_id, external_id, type)
             DO UPDATE SET
               title = EXCLUDED.title,
               url = EXCLUDED.url,
+              image_url = EXCLUDED.image_url,
               content = EXCLUDED.content,
               embedding = EXCLUDED.embedding
             RETURNING id
             `,
             [
               storeDbId,
-              String(item.item_id), // unika chunk-ID:t, t.ex. "768#1"
+              String(item.item_id),
               item.type,
               title,
               url,
+              imageUrl,
               item.text,
               item.embedding,
             ]
@@ -762,6 +787,23 @@ app.post("/chat", async (req, res) => {
     const TOP_N = 5;
     const MAX_SNIPPET_CHARS = 1000;
     const RELEVANCE_THRESHOLD = 0.3;
+    // Bygg produktkort för frontend – topp-produkter med bra score
+    const PRODUCT_CARD_THRESHOLD = 0.4;
+
+    const productCards = top
+      .filter(
+        (entry) =>
+          entry.item.type === "product" &&
+          entry.item.url &&
+          entry.score >= PRODUCT_CARD_THRESHOLD
+      )
+      .slice(0, 3)
+      .map((entry) => ({
+        title: entry.item.title || "Visa produkt",
+        url: entry.item.url,
+        image_url: entry.item.image_url || null,
+        score: entry.score,
+      }));
 
     scored.sort((a, b) => b.score - a.score);
     const top = scored.slice(0, TOP_N);
@@ -898,6 +940,7 @@ app.post("/chat", async (req, res) => {
       })),
       max_relevance_score: maxScore,
       low_confidence: lowConfidence,
+      product_cards: productCards,
     });
   } catch (err) {
     console.error("Error in /chat:", err);
