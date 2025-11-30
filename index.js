@@ -532,6 +532,12 @@ app.post("/index-store", async (req, res) => {
         ]);
 
         // 6b. Upsert varje item i store_items + extrahera fakta
+        // Håll koll på om vi redan har sparat email/phone för den här butiken
+        const seenSingleFacts = {
+          email: false,
+          phone: false,
+        };
+
         for (const item of embeddedItems) {
           let title = "";
           let url = "";
@@ -585,6 +591,16 @@ app.post("/index-store", async (req, res) => {
           const facts = extractFactsFromText(item.text);
 
           for (const fact of facts) {
+            const type = fact.fact_type;
+
+            // Vi vill bara ha MAX 1 email och MAX 1 phone per butik
+            if (type === "email" || type === "phone") {
+              if (seenSingleFacts[type]) {
+                // Hoppa över fler av samma typ
+                continue;
+              }
+            }
+
             await pool.query(
               `
               INSERT INTO store_facts (store_id, source_item_id, fact_type, key, value)
@@ -592,8 +608,13 @@ app.post("/index-store", async (req, res) => {
               ON CONFLICT (store_id, fact_type, value)
               DO NOTHING
               `,
-              [storeDbId, storeItemId, fact.fact_type, fact.key, fact.value]
+              [storeDbId, storeItemId, type, fact.key, fact.value]
             );
+
+            // Markera att vi nu har sparat en sådan här typ
+            if (type === "email" || type === "phone") {
+              seenSingleFacts[type] = true;
+            }
           }
         }
 
