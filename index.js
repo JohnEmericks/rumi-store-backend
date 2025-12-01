@@ -660,6 +660,14 @@ app.post("/index-store", async (req, res) => {
   }
 });
 
+// Explicit CORS preflight handler for /chat// Explicit CORS preflight handler for /chat
+app.options("/chat", (req, res) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  return res.sendStatus(200);
+});
+
 // Explicit CORS preflight handler for /chat
 app.options("/chat", (req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -773,47 +781,51 @@ app.post("/chat", async (req, res) => {
       score: cosineSimilarity(queryVector, item.embedding),
     }));
 
-    // 4) Sort by similarity (descending) and take top N
+    // 4) Sort by similarity (descending) + filtrera svaga träffar
     const TOP_N = 5;
     const MAX_SNIPPET_CHARS = 1000;
-    const RELEVANCE_THRESHOLD = 0.3;
+
+    const RELEVANCE_THRESHOLD = 0.5; // “bra träff”
+    const MIN_CONTEXT_SCORE = 0.35; // minimum för att ens hamna i context
 
     scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, TOP_N);
+
+    // Ta bara med hyfsat relevanta träffar i contextet
+    const filtered = scored.filter((entry) => entry.score >= MIN_CONTEXT_SCORE);
+    const top = filtered.slice(0, TOP_N);
 
     let maxScore = -1;
-    for (const entry of top) {
+    for (const entry of filtered) {
       if (entry.score > maxScore) {
         maxScore = entry.score;
       }
     }
-    const lowConfidence = maxScore < RELEVANCE_THRESHOLD;
 
-    // Produktkort: max 2 relevanta produkter med URL och bild
-    const PRODUCT_CARD_THRESHOLD = 0.4;
-    const productCards = top
-      .filter(
-        (entry) =>
-          entry.item.type === "product" &&
-          entry.item.url &&
-          entry.item.image_url &&
-          entry.score >= PRODUCT_CARD_THRESHOLD
-      )
-      .slice(0, 2)
-      .map((entry) => ({
-        title: entry.item.title || "Visa produkt",
-        url: entry.item.url,
-        image_url: entry.item.image_url,
-        score: entry.score,
-      }));
+    const lowConfidence = maxScore < 0 || maxScore < RELEVANCE_THRESHOLD;
 
-    // 5) Bygg context-strängen från toppträffarna (med trimming)
+    // 5) Bygg context-strängen från toppträffarna (med trimming + produktmeta inkl. image_url)
     const contextParts = top.map((entry, index) => {
       const { item, score } = entry;
 
       let snippet = item.text || "";
       if (snippet.length > MAX_SNIPPET_CHARS) {
         snippet = snippet.slice(0, MAX_SNIPPET_CHARS) + " ...";
+      }
+
+      const metaLines = [];
+      if (item.type === "product") {
+        if (item.title) metaLines.push(`Title: ${item.title}`);
+        // Inga URL:er här – de används bara av UI:t, inte i LLM-kontexten
+      } else if (item.type === "page") {
+        if (item.title) metaLines.push(`Page title: ${item.title}`);
+      } else if (item.type === "page") {
+        if (item.title) metaLines.push(`Page title: ${item.title}`);
+        if (item.url) metaLines.push(`Page URL: ${item.url}`);
+      }
+
+      if (metaLines.length > 0) {
+        snippet +=
+          "\n\n[PRODUCT_META]\n" + metaLines.join("\n") + "\n[/PRODUCT_META]";
       }
 
       return [
@@ -827,7 +839,10 @@ app.post("/chat", async (req, res) => {
       ].join("\n");
     });
 
-    const context = contextParts.join("\n-------------------------\n\n");
+    const context =
+      contextParts.length > 0
+        ? contextParts.join("\n-------------------------\n\n")
+        : "";
 
     const messages = [];
 
@@ -835,18 +850,26 @@ app.post("/chat", async (req, res) => {
     messages.push({
       role: "system",
       content:
-        "You are RUMI, an AI assistant embedded on an online store's website. " +
-        "Act like a friendly, human-like support agent. " +
-        "You can use both the store data provided in this conversation and your general world knowledge to help the user. " +
-        "Always answer in the same language as the user. " +
-        "If you truly cannot find an answer to a store-specific question (like an exact price or opening hours), be honest about that instead of guessing.\n\n" +
+        "You are RUMI, an AI assistant embedded on a specific online store's website. " +
+        "Act like a friendly, human-like support agent for this store only. " +
+        "Your job is to help users with questions about this store, its products, its services, policies, orders, shipping, returns, opening hours and contact details. " +
+        "You must base your answers only on the store data and verified facts provided in this conversation (including structured facts like email, phone and address). " +
+        "You are not allowed to use or reveal general world knowledge that is unrelated to this store. " +
+        "If the user asks about something that is not clearly related to this store (for example movies, history, celebrities, unrelated brands, general facts or personal life advice), you must politely decline and explain that you can only answer questions about this store and its products. " +
+        "If you truly cannot find an answer to a store-specific question (for example an exact price, stock level or opening hours), be honest about that instead of guessing and suggest that the user contacts the store via the available contact details. " +
+        "Always answer in the same language as the user.\n\n" +
         "STYLE:\n" +
         "- Keep answers short and easy to scan in a small chat window.\n" +
         "- Prefer 1–2 short sentences followed by a simple bullet list when it makes sense.\n" +
-        "- Use Markdown: **bold** for important words or product names, and line breaks between paragraphs or list items.\n" +
+        "- Use Markdown only for **bold** text and line breaks. Do NOT use Markdown links (`[text](url)`).\n" +
         "- Do NOT use Markdown image syntax (no `![](url)`) and do NOT use horizontal rules (`---`).\n" +
-        "- When recommending products, suggest at most 2 specific products at a time, as a bullet list with name and a very short description (optionally mention the SKU once).\n" +
-        "- Avoid repeating the same product name or SKU multiple times in the same answer.\n" +
+        "- Do NOT describe or reference the chat UI (do not say things like 'du ser bilden i listan här i chatten' or 'systemet visar bilden åt dig'). Just answer as a normal text-based support agent.\n" +
+        "- When recommending products, recommend exactly **one highly relevant product** by default. Only describe more than one if the user clearly asks for multiple options or a comparison.\n" +
+        "- Use the 'Relevance score' values in the context: ignore products with low scores and never recommend items that do not actually match what the user is asking about.\n" +
+        "- If the user is asking in a broad way about a category (for example 'har ni X?', 'vad säljer ni?', 'vilka X har ni?'), start by briefly clarifying what matters to them (for example type, colour, size, material, use case or price range) **before** you commit to a single specific product or image.\n" +
+        "- If you are not sure which of several similar products the user means, ask one short clarifying question instead of guessing.\n" +
+        "- Never output raw URLs to product pages or images (no 'https://...'). If you need to refer to a product, just use its name and a short description.\n" +
+        "- Avoid repeating the same product name multiple times in a single answer.\n" +
         "- Avoid long blocks of text; split information into multiple lines.",
     });
 
@@ -885,11 +908,14 @@ app.post("/chat", async (req, res) => {
     let ragIntro;
     if (!top.length || lowConfidence) {
       ragIntro =
-        "Jag hittade inga starka matchningar i butikens indexerade innehåll. " +
-        "Här är det som verkar mest relevant, men svara hellre mer allmänt och var tydlig om osäkerheten:";
+        "Det finns inga tillräckligt relevanta butiksdata för den här frågan. " +
+        "Du får inte gissa eller använda allmän världskunskap. " +
+        "Om frågan inte tydligt handlar om den här butiken, dess produkter, tjänster, beställningar, öppettider eller kontaktuppgifter " +
+        "ska du kort förklara att du bara kan svara på frågor om den här butiken och be användaren ställa en sådan fråga istället.";
     } else {
       ragIntro =
-        "Här är information från butikens produkter, tjänster och sidor som verkar relevant:";
+        "Här är information från butikens produkter, tjänster och sidor som verkar relevant. " +
+        "Använd endast denna information (och de verifierade kontaktfakta) när du svarar:";
     }
 
     messages.push({
@@ -916,17 +942,84 @@ app.post("/chat", async (req, res) => {
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1",
       messages,
-      temperature: 0.3,
+      temperature: 0.4,
     });
 
     const answer =
       completion.choices[0]?.message?.content ||
       "Sorry, I could not generate a response.";
 
+    function isProductNameMatch(query, item) {
+      if (!query || !item) return false;
+
+      const q = String(query).toLowerCase();
+      const haystack = (
+        (item.title || "") +
+        " " +
+        (item.text || "")
+      ).toLowerCase();
+
+      // Plocka ut lite “meningsfulla” ord ur frågan
+      const words = q.split(/[^a-zA-Z0-9åäöÅÄÖ]+/).filter((w) => w.length >= 4); // 4+ tecken: få bort “har”, “och”, “den”, osv.
+
+      // Om inget vettigt ord → låt embeddings styra (dvs OK)
+      if (words.length === 0) return true;
+
+      return words.some((w) => haystack.includes(w));
+    }
+
+    // --- Produktkort / bilder ---
+
+    // Bygg en lite större “kontextsträng” för namnmatchning:
+    // nuvarande meddelande + senaste user + senaste assistant
+    let nameMatchContext = message;
+
+    let lastUserMsg = null;
+    let lastAssistantMsg = null;
+
+    for (let i = sanitizedHistory.length - 1; i >= 0; i--) {
+      const m = sanitizedHistory[i];
+      if (!lastUserMsg && m.role === "user") {
+        lastUserMsg = m.content;
+      } else if (!lastAssistantMsg && m.role === "assistant") {
+        lastAssistantMsg = m.content;
+      }
+      if (lastUserMsg && lastAssistantMsg) break;
+    }
+
+    if (lastUserMsg) nameMatchContext += " " + lastUserMsg;
+    if (lastAssistantMsg) nameMatchContext += " " + lastAssistantMsg;
+
+    const PRODUCT_CARD_MAX = 1;
+    const PRODUCT_CARD_MIN_SCORE = 0.35; // lagom strikt
+
+    const productCandidates = top.filter((entry) => {
+      const item = entry.item;
+      return (
+        item.type === "product" &&
+        entry.score >= PRODUCT_CARD_MIN_SCORE &&
+        item.url &&
+        item.image_url &&
+        isProductNameMatch(nameMatchContext, item)
+      );
+    });
+
+    const productCards = productCandidates
+      .slice(0, PRODUCT_CARD_MAX)
+      .map((entry) => {
+        const item = entry.item;
+        return {
+          title: item.title || "",
+          url: item.url,
+          image_url: item.image_url,
+        };
+      });
+
     return res.json({
       ok: true,
       store_id,
       answer,
+      product_cards: productCards,
       used_items: top.map((entry) => ({
         type: entry.item.type,
         item_id: entry.item.item_id,
@@ -934,152 +1027,12 @@ app.post("/chat", async (req, res) => {
       })),
       max_relevance_score: maxScore,
       low_confidence: lowConfidence,
-      product_cards: productCards,
     });
   } catch (err) {
     console.error("Error in /chat:", err);
     return res.status(500).json({
       ok: false,
       error: "Failed to generate chat response",
-    });
-  }
-});
-
-//-------------------- DEBUG ----------------------//
-
-// TEST: simple embeddings debug endpoint
-app.get("/debug-embed-test", async (req, res) => {
-  try {
-    const response = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: "Hello from RUMI! This is a test embedding.",
-    });
-
-    const embedding = response.data[0].embedding;
-
-    return res.json({
-      ok: true,
-      model: "text-embedding-3-small",
-      embedding_dimensions: embedding.length,
-      embedding_preview: embedding.slice(0, 5), // first 5 numbers just as a preview
-    });
-  } catch (err) {
-    console.error("Error in /debug-embed-test:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Failed to create embedding",
-    });
-  }
-});
-
-// GET /debug-index/:store_id  -> see what we stored
-app.get("/debug-index/:store_id", (req, res) => {
-  const storeId = req.params.store_id;
-  const data = storeIndexes[storeId];
-
-  if (!data) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "No index found for this store_id" });
-  }
-
-  return res.json({
-    ok: true,
-    store_id: storeId,
-    index: data,
-  });
-});
-
-// GET /debug-embeddings/:store_id  -> see embedded items for a store
-app.get("/debug-embeddings/:store_id", (req, res) => {
-  const storeId = req.params.store_id;
-  const data = storeEmbeddings[storeId];
-
-  if (!data) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "No embeddings found for this store_id" });
-  }
-
-  // To avoid huge payloads, show only a preview
-  const previewItems = data.items.map((item) => ({
-    type: item.type,
-    item_id: item.item_id,
-    text_preview:
-      item.text.slice(0, 200) + (item.text.length > 200 ? "..." : ""),
-    embedding_dimensions: item.embedding.length,
-  }));
-
-  return res.json({
-    ok: true,
-    store_id: storeId,
-    embeddedAt: data.embeddedAt,
-    items_preview: previewItems,
-  });
-});
-
-// GET /debug-facts/:store_id  -> see extracted facts (email, phone, address, etc.)
-app.get("/debug-facts/:store_id", async (req, res) => {
-  const storeIdString = req.params.store_id;
-
-  try {
-    // Hitta interna store-id
-    const storeRow = await pool.query(
-      "SELECT id FROM stores WHERE store_id = $1",
-      [storeIdString]
-    );
-
-    if (storeRow.rowCount === 0) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "No store found for this store_id" });
-    }
-
-    const storeDbId = storeRow.rows[0].id;
-
-    // Hämta facts + koppla tillbaka till item (så vi ser var de kommer ifrån)
-    const factsRes = await pool.query(
-      `
-      SELECT
-        f.id,
-        f.fact_type,
-        f.key,
-        f.value,
-        i.external_id,
-        i.type AS item_type,
-        i.title AS item_title,
-        i.url   AS item_url
-      FROM store_facts f
-      LEFT JOIN store_items i
-        ON f.source_item_id = i.id
-      WHERE f.store_id = $1
-      ORDER BY f.fact_type, f.value;
-      `,
-      [storeDbId]
-    );
-
-    return res.json({
-      ok: true,
-      store_id: storeIdString,
-      total: factsRes.rowCount,
-      facts: factsRes.rows.map((row) => ({
-        id: row.id,
-        fact_type: row.fact_type,
-        key: row.key,
-        value: row.value,
-        source: {
-          external_id: row.external_id,
-          type: row.item_type,
-          title: row.item_title,
-          url: row.item_url,
-        },
-      })),
-    });
-  } catch (err) {
-    console.error("Error in /debug-facts:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Failed to load facts for this store",
     });
   }
 });
