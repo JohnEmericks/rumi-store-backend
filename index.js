@@ -785,8 +785,8 @@ app.post("/chat", async (req, res) => {
     const TOP_N = 5;
     const MAX_SNIPPET_CHARS = 1000;
 
-    const RELEVANCE_THRESHOLD = 0.5; // “bra träff”
-    const MIN_CONTEXT_SCORE = 0.35; // minimum för att ens hamna i context
+    const RELEVANCE_THRESHOLD = 0.66; // “bra träff”
+    const MIN_CONTEXT_SCORE = 0.5; // minimum för att ens hamna i context
 
     scored.sort((a, b) => b.score - a.score);
 
