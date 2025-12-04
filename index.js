@@ -98,7 +98,87 @@ async function initDb() {
       );
     `);
 
-    console.log("✅ Database initialized");
+    // =========================================================================
+    // PHASE 2: ANALYTICS TABLES
+    // =========================================================================
+
+    // Conversations table - tracks each chat session
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY,
+        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        started_at TIMESTAMPTZ DEFAULT now(),
+        ended_at TIMESTAMPTZ,
+        message_count INTEGER DEFAULT 0,
+        language TEXT,
+        device_type TEXT,
+        status TEXT DEFAULT 'active',
+        UNIQUE (store_id, session_id)
+      );
+    `);
+
+    // Conversation messages - individual messages within conversations
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conv_messages (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        products_shown TEXT[],
+        created_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+
+    // Conversation insights - extracted insights from conversations
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conv_insights (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        insight_type TEXT NOT NULL,
+        value TEXT NOT NULL,
+        confidence FLOAT DEFAULT 1.0,
+        extracted_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+
+    // Create indexes for analytics queries
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conversations_store_id ON conversations(store_id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conversations_started_at ON conversations(started_at);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conv_messages_conversation_id ON conv_messages(conversation_id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conv_insights_store_id ON conv_insights(store_id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conv_insights_type ON conv_insights(insight_type);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_conv_insights_extracted_at ON conv_insights(extracted_at);`
+    );
+
+    // Store settings table for analytics configuration
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS store_settings (
+        id SERIAL PRIMARY KEY,
+        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        setting_key TEXT NOT NULL,
+        setting_value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT now(),
+        UNIQUE (store_id, setting_key)
+      );
+    `);
+
+    console.log("✅ Database initialized (including Phase 2 analytics tables)");
   } catch (err) {
     console.error("❌ Database initialization error:", err);
   }
@@ -166,15 +246,20 @@ function buildItemsForEmbedding(products, pages) {
   const items = [];
 
   (products || []).forEach((p) => {
-    const text = [
+    const textParts = [
       p.title,
       p.short_description,
       p.description,
       (p.categories || []).join(", "),
       p.price ? `Price: ${p.price}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+    ];
+
+    // Add RUMI supplement if present
+    if (p.rumi_supplement) {
+      textParts.push("Additional info: " + p.rumi_supplement);
+    }
+
+    const text = textParts.filter(Boolean).join("\n\n");
 
     if (text.trim()) {
       items.push({
@@ -489,11 +574,461 @@ function analyzeQuery(message, history = [], userLanguage = "Swedish") {
 }
 
 // =============================================================================
+// CONVERSATION TRACKING (Phase 2)
+// =============================================================================
+
+/**
+ * Get or create a conversation for the given session
+ */
+async function getOrCreateConversation(
+  storeDbId,
+  sessionId,
+  language,
+  deviceType
+) {
+  try {
+    // Try to find existing active conversation
+    const existing = await pool.query(
+      `SELECT id, message_count FROM conversations 
+       WHERE store_id = $1 AND session_id = $2 AND status = 'active'`,
+      [storeDbId, sessionId]
+    );
+
+    if (existing.rowCount > 0) {
+      return existing.rows[0];
+    }
+
+    // Create new conversation
+    const result = await pool.query(
+      `INSERT INTO conversations (store_id, session_id, language, device_type, status)
+       VALUES ($1, $2, $3, $4, 'active')
+       RETURNING id, message_count`,
+      [storeDbId, sessionId, language || null, deviceType || null]
+    );
+
+    return result.rows[0];
+  } catch (err) {
+    console.error("Error in getOrCreateConversation:", err);
+    return null;
+  }
+}
+
+/**
+ * Save a message to a conversation
+ */
+async function saveConversationMessage(
+  conversationId,
+  role,
+  content,
+  productsShown = []
+) {
+  try {
+    await pool.query(
+      `INSERT INTO conv_messages (conversation_id, role, content, products_shown)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        conversationId,
+        role,
+        content,
+        productsShown.length > 0 ? productsShown : null,
+      ]
+    );
+
+    // Update message count
+    await pool.query(
+      `UPDATE conversations SET message_count = message_count + 1 WHERE id = $1`,
+      [conversationId]
+    );
+  } catch (err) {
+    console.error("Error in saveConversationMessage:", err);
+  }
+}
+
+/**
+ * Mark a conversation as ended
+ */
+async function endConversation(conversationId) {
+  try {
+    await pool.query(
+      `UPDATE conversations SET status = 'ended', ended_at = now() WHERE id = $1`,
+      [conversationId]
+    );
+  } catch (err) {
+    console.error("Error in endConversation:", err);
+  }
+}
+
+/**
+ * Get the internal store database ID from the public store_id
+ */
+async function getStoreDbId(storeId) {
+  try {
+    const result = await pool.query(
+      "SELECT id FROM stores WHERE store_id = $1",
+      [storeId]
+    );
+    return result.rowCount > 0 ? result.rows[0].id : null;
+  } catch (err) {
+    console.error("Error in getStoreDbId:", err);
+    return null;
+  }
+}
+
+/**
+ * Check for inactive conversations and mark them as ended
+ * This should be called periodically (e.g., every few minutes)
+ */
+async function cleanupInactiveConversations(inactiveMinutes = 15) {
+  try {
+    // Find conversations where the last message was more than X minutes ago
+    const result = await pool.query(`
+      UPDATE conversations c
+      SET status = 'ended', ended_at = now()
+      WHERE c.status = 'active'
+        AND c.id IN (
+          SELECT conversation_id 
+          FROM conv_messages 
+          GROUP BY conversation_id 
+          HAVING MAX(created_at) < now() - interval '${inactiveMinutes} minutes'
+        )
+      RETURNING id, store_id, message_count
+    `);
+
+    if (result.rowCount > 0) {
+      console.log(`Marked ${result.rowCount} inactive conversations as ended`);
+
+      // Trigger insight extraction for each ended conversation
+      for (const conv of result.rows) {
+        if (conv.message_count >= 2) {
+          setImmediate(() => {
+            extractInsightsFromConversation(conv.id, conv.store_id);
+          });
+        }
+      }
+    }
+
+    return result.rowCount;
+  } catch (err) {
+    console.error("Error in cleanupInactiveConversations:", err);
+    return 0;
+  }
+}
+
+// Run cleanup every 5 minutes
+setInterval(() => cleanupInactiveConversations(15), 5 * 60 * 1000);
+
+// =============================================================================
+// INSIGHT EXTRACTION (Phase 2.2)
+// =============================================================================
+
+/**
+ * Extract insights from a completed conversation using AI
+ */
+async function extractInsightsFromConversation(conversationId, storeDbId) {
+  try {
+    // Get all messages from the conversation
+    const messagesResult = await pool.query(
+      `SELECT role, content, products_shown, created_at 
+       FROM conv_messages 
+       WHERE conversation_id = $1 
+       ORDER BY created_at ASC`,
+      [conversationId]
+    );
+
+    if (messagesResult.rowCount < 2) {
+      // Need at least one exchange to extract insights
+      console.log(
+        `Conversation ${conversationId}: Too few messages for insight extraction`
+      );
+      return;
+    }
+
+    // Format conversation for the AI
+    const conversationText = messagesResult.rows
+      .map(
+        (m) => `${m.role === "user" ? "Customer" : "Assistant"}: ${m.content}`
+      )
+      .join("\n\n");
+
+    // Get store's product list for context
+    const productsResult = await pool.query(
+      `SELECT title FROM store_items WHERE store_id = $1 AND type = 'product' LIMIT 100`,
+      [storeDbId]
+    );
+    const productNames = productsResult.rows.map((r) => r.title).join(", ");
+
+    const extractionPrompt = `Analyze this customer service conversation and extract structured insights.
+
+CONVERSATION:
+${conversationText}
+
+STORE'S PRODUCTS (for reference):
+${productNames || "No product list available"}
+
+Extract the following insights in JSON format:
+
+{
+  "product_interests": [
+    // Products the customer showed interest in or asked about
+    // Include both specific products AND general product categories/types
+    // Example: ["Rosenkvarts", "blue crystals", "healing stones"]
+  ],
+  "topics": [
+    // Main topics discussed (not products)
+    // Example: ["shipping", "returns", "gift recommendations", "pricing"]
+  ],
+  "sentiment": "positive" | "neutral" | "frustrated",
+  // Overall customer sentiment based on their messages
+  
+  "unresolved": [
+    // Questions or requests the assistant couldn't fully answer
+    // Or things the customer seemed unsatisfied with
+    // Example: ["asked about international shipping but no clear answer"]
+  ]
+}
+
+Rules:
+- Only include product_interests if the customer actually showed interest (asked about, inquired, wanted to see, etc.)
+- Topics should be general themes, not specific products
+- Be conservative with "frustrated" sentiment - only use if clearly negative
+- Unresolved should capture missed opportunities or gaps in service
+- Return ONLY valid JSON, no markdown or explanation
+
+JSON:`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an expert at analyzing customer conversations and extracting actionable insights. Always respond with valid JSON only.",
+        },
+        { role: "user", content: extractionPrompt },
+      ],
+      temperature: 0.3,
+      max_tokens: 500,
+    });
+
+    const responseText = completion.choices[0]?.message?.content || "{}";
+
+    // Parse the JSON response
+    let insights;
+    try {
+      // Clean up potential markdown formatting
+      const cleanJson = responseText
+        .replace(/```json\n?/g, "")
+        .replace(/```\n?/g, "")
+        .trim();
+      insights = JSON.parse(cleanJson);
+    } catch (parseErr) {
+      console.error(
+        `Conversation ${conversationId}: Failed to parse insights JSON:`,
+        responseText
+      );
+      return;
+    }
+
+    // Store extracted insights
+    const insightsToStore = [];
+
+    // Product interests (priority 1)
+    if (Array.isArray(insights.product_interests)) {
+      for (const product of insights.product_interests) {
+        if (product && typeof product === "string") {
+          insightsToStore.push({
+            type: "product_interest",
+            value: product.trim(),
+            confidence: 0.9,
+          });
+        }
+      }
+    }
+
+    // Topics (priority 2)
+    if (Array.isArray(insights.topics)) {
+      for (const topic of insights.topics) {
+        if (topic && typeof topic === "string") {
+          insightsToStore.push({
+            type: "topic",
+            value: topic.trim().toLowerCase(),
+            confidence: 0.85,
+          });
+        }
+      }
+    }
+
+    // Sentiment (priority 3)
+    if (
+      insights.sentiment &&
+      ["positive", "neutral", "frustrated"].includes(insights.sentiment)
+    ) {
+      insightsToStore.push({
+        type: "sentiment",
+        value: insights.sentiment,
+        confidence: 0.8,
+      });
+    }
+
+    // Unresolved questions (priority 4)
+    if (Array.isArray(insights.unresolved)) {
+      for (const question of insights.unresolved) {
+        if (question && typeof question === "string") {
+          insightsToStore.push({
+            type: "unresolved",
+            value: question.trim(),
+            confidence: 0.75,
+          });
+        }
+      }
+    }
+
+    // Insert all insights
+    for (const insight of insightsToStore) {
+      await pool.query(
+        `INSERT INTO conv_insights (conversation_id, store_id, insight_type, value, confidence)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          conversationId,
+          storeDbId,
+          insight.type,
+          insight.value,
+          insight.confidence,
+        ]
+      );
+    }
+
+    console.log(
+      `Conversation ${conversationId}: Extracted ${insightsToStore.length} insights`
+    );
+
+    // Mark conversation as processed
+    await pool.query(
+      `UPDATE conversations SET status = 'processed' WHERE id = $1`,
+      [conversationId]
+    );
+  } catch (err) {
+    console.error(
+      `Error extracting insights from conversation ${conversationId}:`,
+      err
+    );
+  }
+}
+
+/**
+ * Process all ended conversations that haven't been analyzed yet
+ */
+async function processEndedConversations() {
+  try {
+    // Find ended conversations that haven't been processed
+    const result = await pool.query(`
+      SELECT c.id, c.store_id 
+      FROM conversations c
+      WHERE c.status = 'ended'
+        AND c.message_count >= 2
+      ORDER BY c.ended_at ASC
+      LIMIT 10
+    `);
+
+    if (result.rowCount > 0) {
+      console.log(
+        `Processing ${result.rowCount} ended conversations for insights...`
+      );
+
+      for (const row of result.rows) {
+        await extractInsightsFromConversation(row.id, row.store_id);
+      }
+    }
+  } catch (err) {
+    console.error("Error in processEndedConversations:", err);
+  }
+}
+
+// Run insight extraction every 2 minutes
+setInterval(processEndedConversations, 2 * 60 * 1000);
+
+// Also run once on startup (after a short delay)
+setTimeout(processEndedConversations, 30 * 1000);
+
+// =============================================================================
 // ROUTES
 // =============================================================================
 
 // Health check
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Index status - get counts and facts for the index viewer
+app.get("/index-status", async (req, res) => {
+  const { store_id, api_key } = req.query || {};
+
+  if (!store_id || !api_key) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and api_key are required" });
+  }
+
+  try {
+    // Verify store credentials
+    const storeRow = await pool.query(
+      "SELECT id FROM stores WHERE store_id = $1 AND api_key = $2",
+      [store_id, api_key]
+    );
+
+    if (storeRow.rowCount === 0) {
+      return res
+        .status(401)
+        .json({ ok: false, error: "Invalid store_id or api_key" });
+    }
+
+    const storeDbId = storeRow.rows[0].id;
+
+    // Get counts
+    const productCount = await pool.query(
+      "SELECT COUNT(*) FROM store_items WHERE store_id = $1 AND type = 'product'",
+      [storeDbId]
+    );
+    const pageCount = await pool.query(
+      "SELECT COUNT(*) FROM store_items WHERE store_id = $1 AND type = 'page'",
+      [storeDbId]
+    );
+    const embeddingCount = await pool.query(
+      "SELECT COUNT(*) FROM store_items WHERE store_id = $1 AND embedding IS NOT NULL",
+      [storeDbId]
+    );
+    const factCount = await pool.query(
+      "SELECT COUNT(*) FROM store_facts WHERE store_id = $1",
+      [storeDbId]
+    );
+
+    // Get facts
+    const factsResult = await pool.query(
+      "SELECT fact_type, key, value FROM store_facts WHERE store_id = $1 ORDER BY fact_type, id",
+      [storeDbId]
+    );
+
+    const facts = factsResult.rows.map((row) => ({
+      type: row.fact_type,
+      value: row.value,
+      source: row.key === "manual" ? "Manual entry" : "Auto-detected",
+    }));
+
+    return res.json({
+      ok: true,
+      counts: {
+        products: parseInt(productCount.rows[0].count),
+        pages: parseInt(pageCount.rows[0].count),
+        embeddings: parseInt(embeddingCount.rows[0].count),
+        facts: parseInt(factCount.rows[0].count),
+      },
+      facts,
+    });
+  } catch (err) {
+    console.error("Error in /index-status:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to get index status" });
+  }
+});
 
 // Register store
 app.post("/register-store", async (req, res) => {
@@ -651,9 +1186,18 @@ app.post("/index-store", async (req, res) => {
     if (storeRow.rowCount > 0) {
       const storeDbId = storeRow.rows[0].id;
 
+      // IMPORTANT: Clear ALL existing items and facts before re-indexing
+      // This ensures excluded items are actually removed
+      await pool.query("DELETE FROM store_items WHERE store_id = $1", [
+        storeDbId,
+      ]);
       await pool.query("DELETE FROM store_facts WHERE store_id = $1", [
         storeDbId,
       ]);
+
+      console.log(
+        `Cleared existing items for store_id=${store_id}, inserting ${embeddedItems.length} new items`
+      );
 
       // First, add manual contact info if provided (these take priority)
       if (contact_info.email) {
@@ -686,13 +1230,10 @@ app.post("/index-store", async (req, res) => {
       const hasManualPhone = !!contact_info.phone;
 
       for (const item of embeddedItems) {
+        // Now we can use simple INSERT since we cleared everything
         const itemRes = await pool.query(
           `INSERT INTO store_items (store_id, external_id, type, title, url, image_url, content, embedding, price, stock_status, in_stock)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           ON CONFLICT (store_id, external_id, type)
-           DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url, image_url = EXCLUDED.image_url,
-                         content = EXCLUDED.content, embedding = EXCLUDED.embedding, price = EXCLUDED.price,
-                         stock_status = EXCLUDED.stock_status, in_stock = EXCLUDED.in_stock
            RETURNING id`,
           [
             storeDbId,
@@ -752,7 +1293,14 @@ app.post("/index-store", async (req, res) => {
 
 // Chat endpoint
 app.post("/chat", async (req, res) => {
-  let { store_id, message, history = [], language } = req.body || {};
+  let {
+    store_id,
+    message,
+    history = [],
+    language,
+    session_id,
+    device_type,
+  } = req.body || {};
 
   if (!store_id || !message) {
     return res
@@ -780,6 +1328,9 @@ app.post("/chat", async (req, res) => {
       });
   }
 
+  // Get store database ID for conversation tracking
+  const storeDbId = await getStoreDbId(store_id);
+
   // Determine language: use frontend config, fallback to store personality, then detection
   let userLanguage = "Swedish"; // Default to Swedish
 
@@ -793,6 +1344,21 @@ app.post("/chat", async (req, res) => {
     userLanguage = "English";
   }
   // Note: We no longer try to detect from message content - we trust the configured language
+
+  // Track conversation (Phase 2)
+  let conversation = null;
+  if (storeDbId && session_id) {
+    conversation = await getOrCreateConversation(
+      storeDbId,
+      session_id,
+      language,
+      device_type
+    );
+    if (conversation) {
+      // Save user message
+      await saveConversationMessage(conversation.id, "user", message, []);
+    }
+  }
 
   try {
     // Analyze the query (pass the determined language)
@@ -813,10 +1379,23 @@ app.post("/chat", async (req, res) => {
         ],
       };
       const options = greetings[userLanguage];
+      const greetingResponse =
+        options[Math.floor(Math.random() * options.length)];
+
+      // Save assistant response
+      if (conversation) {
+        await saveConversationMessage(
+          conversation.id,
+          "assistant",
+          greetingResponse,
+          []
+        );
+      }
+
       return res.json({
         ok: true,
         store_id,
-        answer: options[Math.floor(Math.random() * options.length)],
+        answer: greetingResponse,
         product_cards: [],
       });
     }
@@ -1017,6 +1596,17 @@ app.post("/chat", async (req, res) => {
         }));
     }
 
+    // Save assistant response to conversation (Phase 2)
+    if (conversation) {
+      const productsShown = productCards.map((p) => p.title);
+      await saveConversationMessage(
+        conversation.id,
+        "assistant",
+        answer,
+        productsShown
+      );
+    }
+
     return res.json({
       ok: true,
       store_id,
@@ -1044,6 +1634,315 @@ app.post("/chat", async (req, res) => {
 // =============================================================================
 // START SERVER
 // =============================================================================
+
+// End conversation endpoint (called when user closes chat)
+app.post("/end-conversation", async (req, res) => {
+  const { store_id, session_id } = req.body || {};
+
+  if (!store_id || !session_id) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and session_id are required" });
+  }
+
+  try {
+    const storeDbId = await getStoreDbId(store_id);
+    if (!storeDbId) {
+      return res.status(404).json({ ok: false, error: "Store not found" });
+    }
+
+    const result = await pool.query(
+      `UPDATE conversations 
+       SET status = 'ended', ended_at = now() 
+       WHERE store_id = $1 AND session_id = $2 AND status = 'active'
+       RETURNING id, message_count`,
+      [storeDbId, session_id]
+    );
+
+    if (result.rowCount > 0) {
+      const conv = result.rows[0];
+      console.log(
+        `Conversation ${conv.id} ended (chat closed, ${conv.message_count} messages)`
+      );
+
+      // Trigger insight extraction asynchronously (don't wait for it)
+      if (conv.message_count >= 2) {
+        setImmediate(() => {
+          extractInsightsFromConversation(conv.id, storeDbId);
+        });
+      }
+    }
+
+    return res.json({ ok: true, ended: result.rowCount > 0 });
+  } catch (err) {
+    console.error("Error in /end-conversation:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to end conversation" });
+  }
+});
+
+// =============================================================================
+// ANALYTICS API ENDPOINTS (Phase 2.3)
+// =============================================================================
+
+// Get analytics overview for a store
+app.get("/analytics/overview", async (req, res) => {
+  const { store_id, api_key, days = 30 } = req.query || {};
+
+  if (!store_id || !api_key) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and api_key are required" });
+  }
+
+  try {
+    // Verify credentials
+    const storeRow = await pool.query(
+      "SELECT id FROM stores WHERE store_id = $1 AND api_key = $2",
+      [store_id, api_key]
+    );
+
+    if (storeRow.rowCount === 0) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials" });
+    }
+
+    const storeDbId = storeRow.rows[0].id;
+    const daysInt = parseInt(days) || 30;
+
+    // Get conversation stats
+    const convStats = await pool.query(
+      `
+      SELECT 
+        COUNT(*) as total_conversations,
+        COUNT(CASE WHEN status = 'processed' THEN 1 END) as processed_conversations,
+        COALESCE(AVG(message_count), 0) as avg_messages,
+        COUNT(CASE WHEN device_type = 'mobile' THEN 1 END) as mobile_count,
+        COUNT(CASE WHEN device_type = 'desktop' THEN 1 END) as desktop_count
+      FROM conversations 
+      WHERE store_id = $1 
+        AND started_at > now() - interval '${daysInt} days'
+    `,
+      [storeDbId]
+    );
+
+    // Get top product interests
+    const productInterests = await pool.query(
+      `
+      SELECT value, COUNT(*) as count
+      FROM conv_insights
+      WHERE store_id = $1 
+        AND insight_type = 'product_interest'
+        AND extracted_at > now() - interval '${daysInt} days'
+      GROUP BY value
+      ORDER BY count DESC
+      LIMIT 10
+    `,
+      [storeDbId]
+    );
+
+    // Get top topics
+    const topics = await pool.query(
+      `
+      SELECT value, COUNT(*) as count
+      FROM conv_insights
+      WHERE store_id = $1 
+        AND insight_type = 'topic'
+        AND extracted_at > now() - interval '${daysInt} days'
+      GROUP BY value
+      ORDER BY count DESC
+      LIMIT 10
+    `,
+      [storeDbId]
+    );
+
+    // Get sentiment breakdown
+    const sentiments = await pool.query(
+      `
+      SELECT value, COUNT(*) as count
+      FROM conv_insights
+      WHERE store_id = $1 
+        AND insight_type = 'sentiment'
+        AND extracted_at > now() - interval '${daysInt} days'
+      GROUP BY value
+    `,
+      [storeDbId]
+    );
+
+    // Get recent unresolved questions
+    const unresolved = await pool.query(
+      `
+      SELECT value, extracted_at
+      FROM conv_insights
+      WHERE store_id = $1 
+        AND insight_type = 'unresolved'
+        AND extracted_at > now() - interval '${daysInt} days'
+      ORDER BY extracted_at DESC
+      LIMIT 10
+    `,
+      [storeDbId]
+    );
+
+    // Get conversations per day for chart
+    const conversationsPerDay = await pool.query(
+      `
+      SELECT 
+        DATE(started_at) as date,
+        COUNT(*) as count
+      FROM conversations
+      WHERE store_id = $1 
+        AND started_at > now() - interval '${daysInt} days'
+      GROUP BY DATE(started_at)
+      ORDER BY date ASC
+    `,
+      [storeDbId]
+    );
+
+    return res.json({
+      ok: true,
+      period_days: daysInt,
+      stats: {
+        total_conversations: parseInt(convStats.rows[0].total_conversations),
+        processed_conversations: parseInt(
+          convStats.rows[0].processed_conversations
+        ),
+        avg_messages_per_conversation: parseFloat(
+          convStats.rows[0].avg_messages
+        ).toFixed(1),
+        mobile_percentage:
+          convStats.rows[0].total_conversations > 0
+            ? Math.round(
+                (convStats.rows[0].mobile_count /
+                  convStats.rows[0].total_conversations) *
+                  100
+              )
+            : 0,
+      },
+      product_interests: productInterests.rows.map((r) => ({
+        name: r.value,
+        count: parseInt(r.count),
+      })),
+      topics: topics.rows.map((r) => ({
+        name: r.value,
+        count: parseInt(r.count),
+      })),
+      sentiment: {
+        positive: parseInt(
+          sentiments.rows.find((r) => r.value === "positive")?.count || 0
+        ),
+        neutral: parseInt(
+          sentiments.rows.find((r) => r.value === "neutral")?.count || 0
+        ),
+        frustrated: parseInt(
+          sentiments.rows.find((r) => r.value === "frustrated")?.count || 0
+        ),
+      },
+      unresolved: unresolved.rows.map((r) => ({
+        question: r.value,
+        date: r.extracted_at,
+      })),
+      conversations_per_day: conversationsPerDay.rows.map((r) => ({
+        date: r.date,
+        count: parseInt(r.count),
+      })),
+    });
+  } catch (err) {
+    console.error("Error in /analytics/overview:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to get analytics" });
+  }
+});
+
+// Get recent conversations for review
+app.get("/analytics/conversations", async (req, res) => {
+  const { store_id, api_key, limit = 20, offset = 0 } = req.query || {};
+
+  if (!store_id || !api_key) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and api_key are required" });
+  }
+
+  try {
+    const storeRow = await pool.query(
+      "SELECT id FROM stores WHERE store_id = $1 AND api_key = $2",
+      [store_id, api_key]
+    );
+
+    if (storeRow.rowCount === 0) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials" });
+    }
+
+    const storeDbId = storeRow.rows[0].id;
+    const limitInt = Math.min(parseInt(limit) || 20, 100);
+    const offsetInt = parseInt(offset) || 0;
+
+    // Get conversations with their insights
+    const conversations = await pool.query(
+      `
+      SELECT 
+        c.id, c.session_id, c.started_at, c.ended_at, 
+        c.message_count, c.language, c.device_type, c.status
+      FROM conversations c
+      WHERE c.store_id = $1
+      ORDER BY c.started_at DESC
+      LIMIT $2 OFFSET $3
+    `,
+      [storeDbId, limitInt, offsetInt]
+    );
+
+    // Get messages and insights for each conversation
+    const result = [];
+    for (const conv of conversations.rows) {
+      const messages = await pool.query(
+        `SELECT role, content, products_shown, created_at 
+         FROM conv_messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
+        [conv.id]
+      );
+
+      const insights = await pool.query(
+        `SELECT insight_type, value, confidence 
+         FROM conv_insights WHERE conversation_id = $1`,
+        [conv.id]
+      );
+
+      result.push({
+        id: conv.id,
+        started_at: conv.started_at,
+        ended_at: conv.ended_at,
+        message_count: conv.message_count,
+        language: conv.language,
+        device_type: conv.device_type,
+        status: conv.status,
+        messages: messages.rows,
+        insights: insights.rows.map((i) => ({
+          type: i.insight_type,
+          value: i.value,
+        })),
+      });
+    }
+
+    // Get total count
+    const totalCount = await pool.query(
+      "SELECT COUNT(*) FROM conversations WHERE store_id = $1",
+      [storeDbId]
+    );
+
+    return res.json({
+      ok: true,
+      conversations: result,
+      total: parseInt(totalCount.rows[0].count),
+      limit: limitInt,
+      offset: offsetInt,
+    });
+  } catch (err) {
+    console.error("Error in /analytics/conversations:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to get conversations" });
+  }
+});
 
 initDb();
 
