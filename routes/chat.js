@@ -239,7 +239,8 @@ router.post("/chat", async (req, res) => {
               : e.item.content;
           context += `${desc}\n`;
         }
-        context += `URL: ${e.item.url}\n\n`;
+        // Don't include URL - the AI shouldn't output links
+        context += "\n";
       });
     }
 
@@ -252,9 +253,9 @@ router.post("/chat", async (req, res) => {
       });
     }
 
-    // Add store facts
-    if (storeFacts.length > 0) {
-      context += "## CONTACT INFO\n";
+    // Only add contact info if the query seems contact-related
+    if (queryContext.isContactQuery && storeFacts.length > 0) {
+      context += "## CONTACT INFO (user asked about this)\n";
       storeFacts.forEach((f) => {
         context += `${f.fact_type}: ${f.value}\n`;
       });
@@ -279,8 +280,6 @@ router.post("/chat", async (req, res) => {
 
 ## LANGUAGE - CRITICAL
 You MUST respond in ${userLanguage}. Always. Every single response must be in ${userLanguage}.
-Even if the user writes short words like "ok", "ja", "nej" - still respond in ${userLanguage}.
-Never switch to English unless the user explicitly asks for English.
 
 ## YOUR PERSONALITY
 Tone: ${toneDescriptions[personality.tone] || toneDescriptions.friendly}
@@ -291,19 +290,63 @@ ${
     : ""
 }
 
+## RESPONSE STYLE - VERY IMPORTANT
+Keep responses SHORT and conversational:
+- 1-2 sentences for simple questions
+- 3-4 sentences maximum for complex questions
+- Never write long paragraphs or walls of text
+- Chat like a helpful friend, not a formal assistant
+- Be natural and warm, not robotic
+
+## THINGS YOU MUST NEVER DO
+- NEVER include URLs or links in your response
+- NEVER use markdown link format like [text](url)
+- NEVER list out contact information unless the user specifically asks for it
+- NEVER output product URLs - product cards with links appear automatically
+- If someone MIGHT want contact info but didn't explicitly ask, offer first: "Vill du ha våra kontaktuppgifter?" / "Would you like our contact details?"
+
+## ABOUT PRODUCTS
+When recommending products:
+- Just mention the product name naturally in your response
+- A clickable product card with image and link will appear automatically below your message
+- Don't say "click here" or provide any URLs
+- Keep the description brief - the customer can see details on the card
+
+Example GOOD response:
+"Rosenkvarts Cuddle Stone skulle passa perfekt för det! Den är en av våra mest populära lugnande stenar. ✨"
+
+Example BAD response:
+"Jag rekommenderar Rosenkvarts Cuddle Stone. Du kan hitta den här: [Rosenkvarts Cuddle Stone](https://example.com/produkt/123). Den kostar 149 kr och är känd för sina lugnande egenskaper och har använts i tusentals år för helande..."
+
 ## RULES
-- Answer based on the store data provided below
-- Keep responses concise (2-3 short paragraphs max)
-- If recommending a product, mention its name clearly
-- If you don't know something, say so politely
-- Never make up information about products`;
+- Answer based ONLY on the store data provided
+- If you don't know something, say so briefly and politely
+- Never make up information about products or policies
+
+## HANDLING FOLLOW-UP QUESTIONS
+- When the user says "it", "that one", "den", "det", etc., check the conversation history
+- Look for "[You showed product cards for: ...]" notes to see what products were just discussed
+- Connect their question to the most recently mentioned/shown product`;
 
     const messages = [{ role: "system", content: systemPrompt }];
 
-    // Add conversation history
+    // Add conversation history with product context
     if (history.length > 0) {
       history.slice(-6).forEach((h) => {
-        messages.push({ role: h.role, content: h.content });
+        if (
+          h.role === "assistant" &&
+          h.products_shown &&
+          h.products_shown.length > 0
+        ) {
+          // Include what products were shown/discussed with this response
+          const productContext = h.products_shown.join(", ");
+          messages.push({
+            role: h.role,
+            content: `${h.content}\n[You showed product cards for: ${productContext}]`,
+          });
+        } else {
+          messages.push({ role: h.role, content: h.content });
+        }
       });
     }
 
@@ -325,47 +368,125 @@ ${
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages,
-      temperature: 0.4,
-      max_tokens: 400,
+      temperature: 0.5,
+      max_tokens: 250,
     });
 
     const answer =
       completion.choices[0]?.message?.content ||
       "Sorry, I couldn't generate a response.";
+    const answerLower = answer.toLowerCase();
 
-    // Determine product cards
-    const cardThreshold = queryContext.isVisual ? 0.32 : 0.45;
-    const productCandidates = relevantProducts.filter(
-      (e) => e.score >= cardThreshold && e.item.url && e.item.image_url
-    );
+    /**
+     * Calculate how well a product matches the AI's answer
+     * Higher score = better match
+     *
+     * Key principle: If the AI says "Bergkristall Geod", we want to match
+     * "Bergkristall Geod" not just "Bergkristall"
+     */
+    function calculateProductMatchScore(item, answerText) {
+      const title = item.title || "";
+      const titleLower = title.toLowerCase();
 
+      // Check for exact title match (best possible match)
+      if (answerText.includes(titleLower)) {
+        return 1000 + titleLower.length; // Longer exact matches score higher
+      }
+
+      // Check for product code match (e.g., "A11-CL-003")
+      const codeMatch = title.match(/[A-Z]{1,3}\d{1,2}-[A-Z]{1,3}-\d{3}/i);
+      if (codeMatch && answerText.includes(codeMatch[0].toLowerCase())) {
+        return 900;
+      }
+
+      // Split title into words
+      const titleWords = titleLower
+        .split(/[\s\-–—\|,]+/)
+        .filter((w) => w.length >= 3);
+
+      if (titleWords.length === 0) return 0;
+
+      // Common/generic words worth less
+      const commonWords = new Set([
+        "sten",
+        "stenar",
+        "stone",
+        "stones",
+        "crystal",
+        "crystals",
+        "kristall",
+        "kristaller",
+        "cuddle",
+        "kvalitet",
+        "quality",
+        "specimen",
+        "cluster",
+        "kluster",
+        "aaa",
+        "liten",
+        "stor",
+      ]);
+
+      let matchedCount = 0;
+      let specificMatchCount = 0;
+
+      for (const word of titleWords) {
+        if (answerText.includes(word)) {
+          matchedCount++;
+          if (!commonWords.has(word)) {
+            specificMatchCount++;
+          }
+        }
+      }
+
+      // No matches = no score
+      if (matchedCount === 0) return 0;
+
+      // Calculate score:
+      // - Base: 10 points per specific word matched
+      // - Bonus: Higher percentage of title words matched = better
+      // - Penalty: Unmatched words in title reduce score (prevents "Bergkristall" beating "Bergkristall Geod")
+
+      const matchRatio = matchedCount / titleWords.length;
+      const unmatchedWords = titleWords.length - matchedCount;
+
+      let score = 0;
+      score += specificMatchCount * 20; // 20 points per specific word
+      score += matchedCount * 5; // 5 points per any word
+      score += matchRatio * 100; // Up to 100 points for full match
+      score -= unmatchedWords * 15; // Penalty for unmatched words in title
+
+      return Math.max(0, score);
+    }
+
+    // Find the product that best matches what the AI mentioned
     let productCards = [];
 
-    if (queryContext.isVisual && productCandidates.length > 0) {
-      productCards = [productCandidates[0]].map((e) => ({
-        title: e.item.title,
-        url: e.item.url,
-        image_url: e.item.image_url,
-        price: e.item.price || null,
-      }));
-    } else if (productCandidates.length > 0) {
-      const answerLower = answer.toLowerCase();
-      productCards = productCandidates
-        .slice(0, 2)
-        .filter((e) => {
-          const words = e.item.title
-            .toLowerCase()
-            .split(/\s+/)
-            .filter((w) => w.length >= 3);
-          return words.some((w) => answerLower.includes(w));
-        })
-        .slice(0, 1)
-        .map((e) => ({
-          title: e.item.title,
-          url: e.item.url,
-          image_url: e.item.image_url,
-          price: e.item.price || null,
-        }));
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const item of storeData.items) {
+      if (item.type !== "product") continue;
+      if (!item.url || !item.image_url) continue;
+
+      const score = calculateProductMatchScore(item, answerLower);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = item;
+      }
+    }
+
+    // Only show card if we have a meaningful match
+    if (bestMatch && bestScore >= 10) {
+      productCards = [
+        {
+          title: bestMatch.title,
+          url: bestMatch.url,
+          image_url: bestMatch.image_url,
+          price: bestMatch.price || null,
+        },
+      ];
     }
 
     // Save assistant response
@@ -388,6 +509,7 @@ ${
         query: queryContext,
         products_found: relevantProducts.length,
         pages_found: relevantPages.length,
+        contact_info_included: queryContext.isContactQuery,
         best_product_score: bestProductScore.toFixed(3),
         top_products: relevantProducts.slice(0, 3).map((e) => ({
           title: e.item.title,

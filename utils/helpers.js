@@ -71,6 +71,41 @@ function analyzeQuery(message, history = [], userLanguage = "Swedish") {
   ];
   const isProductQuery = productIndicators.some((w) => lowerMsg.includes(w));
 
+  // Contact query detection
+  const contactIndicators = [
+    "kontakt",
+    "kontakta",
+    "nå er",
+    "nå dig",
+    "ringa",
+    "ring",
+    "telefon",
+    "telefonnummer",
+    "mail",
+    "email",
+    "e-post",
+    "epost",
+    "öppettider",
+    "öppet",
+    "stängt",
+    "adress",
+    "besök",
+    "hitta er",
+    "contact",
+    "reach",
+    "call",
+    "phone",
+    "email",
+    "address",
+    "hours",
+    "open",
+    "closed",
+    "location",
+    "find you",
+    "get in touch",
+  ];
+  const isContactQuery = contactIndicators.some((w) => lowerMsg.includes(w));
+
   // Follow-up detection
   const followUpWords = [
     "den",
@@ -122,6 +157,7 @@ function analyzeQuery(message, history = [], userLanguage = "Swedish") {
     isGreeting,
     isVisual,
     isProductQuery,
+    isContactQuery,
     isFollowUp,
     userLanguage,
   };
