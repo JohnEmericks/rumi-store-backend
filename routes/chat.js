@@ -21,21 +21,32 @@ const {
 const {
   extractInsightsFromConversation,
 } = require("../services/insight-extractor");
+const {
+  incrementConversation,
+  incrementMessage,
+} = require("../services/license");
 
 /**
- * Load store data from database
+ * Load store data from database (includes license info)
  */
 async function loadStoreDataFromDb(storeId) {
   try {
     const storeRow = await pool.query(
-      "SELECT id, store_name, personality FROM stores WHERE store_id = $1",
+      `SELECT s.id, s.store_name, s.personality, s.license_key_id,
+              lk.is_active as license_active, lk.plan,
+              pl.conversations_per_month as plan_limit
+       FROM stores s
+       LEFT JOIN license_keys lk ON s.license_key_id = lk.id
+       LEFT JOIN plan_limits pl ON lk.plan = pl.plan_name
+       WHERE s.store_id = $1`,
       [storeId]
     );
 
     if (storeRow.rowCount === 0) return null;
 
-    const storeDbId = storeRow.rows[0].id;
-    const personality = storeRow.rows[0].personality || {};
+    const store = storeRow.rows[0];
+    const storeDbId = store.id;
+    const personality = store.personality || {};
 
     const itemsRow = await pool.query(
       "SELECT type, title, url, image_url, content, embedding, price, in_stock FROM store_items WHERE store_id = $1",
@@ -53,8 +64,12 @@ async function loadStoreDataFromDb(storeId) {
         price: r.price,
         in_stock: r.in_stock,
       })),
-      storeName: storeRow.rows[0].store_name,
+      storeName: store.store_name,
       personality,
+      licenseKeyId: store.license_key_id,
+      licenseActive: store.license_active,
+      plan: store.plan,
+      planLimit: store.plan_limit,
     };
   } catch (err) {
     console.error("Error loading store data:", err);
@@ -113,7 +128,7 @@ router.post("/chat", async (req, res) => {
       .json({ ok: false, error: "message cannot be empty" });
   }
 
-  // Load store data
+  // Load store data (includes license info)
   const storeData = await loadStoreDataFromDb(store_id);
   const storeFacts = await loadStoreFactsFromDb(store_id);
 
@@ -124,6 +139,44 @@ router.post("/chat", async (req, res) => {
         ok: false,
         error: "No data found for this store. Please index the store first.",
       });
+  }
+
+  // Check license status
+  if (storeData.licenseKeyId) {
+    if (!storeData.licenseActive) {
+      return res.status(403).json({
+        ok: false,
+        error: "license_deactivated",
+        message:
+          "This store's license has been deactivated. Please contact support.",
+        show_to_customer:
+          "Chatten är tillfälligt otillgänglig. Vänligen försök igen senare.",
+      });
+    }
+
+    // Check usage limits (if not unlimited)
+    if (storeData.planLimit !== null) {
+      const usageResult = await pool.query(
+        `SELECT conversations_used FROM usage_tracking 
+         WHERE license_key_id = $1 AND period_start <= now() AND period_end > now()
+         LIMIT 1`,
+        [storeData.licenseKeyId]
+      );
+
+      const currentUsage = usageResult.rows[0]?.conversations_used || 0;
+
+      if (currentUsage >= storeData.planLimit) {
+        return res.status(403).json({
+          ok: false,
+          error: "limit_reached",
+          message: `Monthly conversation limit reached (${currentUsage}/${storeData.planLimit}). Please upgrade your plan.`,
+          show_to_customer:
+            "Chatten är tillfälligt otillgänglig. Vänligen försök igen senare.",
+          upgrade_needed: true,
+          plan: storeData.plan,
+        });
+      }
+    }
   }
 
   // Get store database ID for conversation tracking
@@ -142,9 +195,16 @@ router.post("/chat", async (req, res) => {
     userLanguage = "English";
   }
 
-  // Track conversation
+  // Track conversation (check if this is a new conversation for billing)
   let conversation = null;
+  let isNewConversation = false;
   if (storeDbId && session_id) {
+    const existingConv = await pool.query(
+      `SELECT id FROM conversations WHERE store_id = $1 AND session_id = $2`,
+      [storeDbId, session_id]
+    );
+    isNewConversation = existingConv.rowCount === 0;
+
     conversation = await getOrCreateConversation(
       storeDbId,
       session_id,
@@ -154,6 +214,16 @@ router.post("/chat", async (req, res) => {
     if (conversation) {
       await saveConversationMessage(conversation.id, "user", message, []);
     }
+
+    // Increment conversation count for billing (only for new conversations)
+    if (isNewConversation && storeData.licenseKeyId) {
+      await incrementConversation(storeData.licenseKeyId, storeDbId);
+    }
+  }
+
+  // Track message for usage stats
+  if (storeData.licenseKeyId) {
+    await incrementMessage(storeData.licenseKeyId);
   }
 
   try {
@@ -305,18 +375,23 @@ Keep responses SHORT and conversational:
 - NEVER output product URLs - product cards with links appear automatically
 - If someone MIGHT want contact info but didn't explicitly ask, offer first: "Vill du ha våra kontaktuppgifter?" / "Would you like our contact details?"
 
-## ABOUT PRODUCTS
-When recommending products:
-- Just mention the product name naturally in your response
-- A clickable product card with image and link will appear automatically below your message
-- Don't say "click here" or provide any URLs
-- Keep the description brief - the customer can see details on the card
+## PRODUCT TAG - CRITICAL
+When you mention or recommend a product, you MUST end your response with the exact product name in double curly braces.
+This tag is used by the system to show the correct product card. Use the EXACT product name from the store data.
 
-Example GOOD response:
-"Rosenkvarts Cuddle Stone skulle passa perfekt för det! Den är en av våra mest populära lugnande stenar. ✨"
+Format: {{Exact Product Name}}
 
-Example BAD response:
-"Jag rekommenderar Rosenkvarts Cuddle Stone. Du kan hitta den här: [Rosenkvarts Cuddle Stone](https://example.com/produkt/123). Den kostar 149 kr och är känd för sina lugnande egenskaper och har använts i tusentals år för helande..."
+Examples:
+- "Rosenkvarts Cuddle Stone skulle passa perfekt för det! Den är lugn och fin. {{Rosenkvarts Cuddle Stone}}"
+- "Den har vackra glittrande kristaller inuti. {{Bergkristall Geod}}"
+- "Vi har två alternativ - Malakit Sten för 150 kr eller det exklusiva Malakit Stalaktit Specimen. {{Malakit Sten}}"
+
+Rules for the product tag:
+- Always place it at the very end of your response
+- Use the EXACT name as it appears in the product list
+- Only include ONE product in the tag (the main/primary recommendation)
+- If you're answering a follow-up about a previously discussed product, still include the tag
+- If you're NOT recommending any specific product, don't include any tag
 
 ## RULES
 - Answer based ONLY on the store data provided
@@ -326,7 +401,8 @@ Example BAD response:
 ## HANDLING FOLLOW-UP QUESTIONS
 - When the user says "it", "that one", "den", "det", etc., check the conversation history
 - Look for "[You showed product cards for: ...]" notes to see what products were just discussed
-- Connect their question to the most recently mentioned/shown product`;
+- Connect their question to the most recently mentioned/shown product
+- Still include the {{Product Name}} tag at the end`;
 
     const messages = [{ role: "system", content: systemPrompt }];
 
@@ -372,121 +448,95 @@ Example BAD response:
       max_tokens: 250,
     });
 
-    const answer =
+    const rawAnswer =
       completion.choices[0]?.message?.content ||
       "Sorry, I couldn't generate a response.";
-    const answerLower = answer.toLowerCase();
 
-    /**
-     * Calculate how well a product matches the AI's answer
-     * Higher score = better match
-     *
-     * Key principle: If the AI says "Bergkristall Geod", we want to match
-     * "Bergkristall Geod" not just "Bergkristall"
-     */
-    function calculateProductMatchScore(item, answerText) {
-      const title = item.title || "";
-      const titleLower = title.toLowerCase();
+    // Extract product tag from response: {{Product Name}}
+    const productTagMatch = rawAnswer.match(/\{\{([^}]+)\}\}/);
+    const taggedProductName = productTagMatch
+      ? productTagMatch[1].trim()
+      : null;
 
-      // Check for exact title match (best possible match)
-      if (answerText.includes(titleLower)) {
-        return 1000 + titleLower.length; // Longer exact matches score higher
-      }
+    // Remove the tag from the displayed answer
+    const answer = rawAnswer.replace(/\s*\{\{[^}]+\}\}\s*$/, "").trim();
 
-      // Check for product code match (e.g., "A11-CL-003")
-      const codeMatch = title.match(/[A-Z]{1,3}\d{1,2}-[A-Z]{1,3}-\d{3}/i);
-      if (codeMatch && answerText.includes(codeMatch[0].toLowerCase())) {
-        return 900;
-      }
-
-      // Split title into words
-      const titleWords = titleLower
-        .split(/[\s\-–—\|,]+/)
-        .filter((w) => w.length >= 3);
-
-      if (titleWords.length === 0) return 0;
-
-      // Common/generic words worth less
-      const commonWords = new Set([
-        "sten",
-        "stenar",
-        "stone",
-        "stones",
-        "crystal",
-        "crystals",
-        "kristall",
-        "kristaller",
-        "cuddle",
-        "kvalitet",
-        "quality",
-        "specimen",
-        "cluster",
-        "kluster",
-        "aaa",
-        "liten",
-        "stor",
-      ]);
-
-      let matchedCount = 0;
-      let specificMatchCount = 0;
-
-      for (const word of titleWords) {
-        if (answerText.includes(word)) {
-          matchedCount++;
-          if (!commonWords.has(word)) {
-            specificMatchCount++;
-          }
-        }
-      }
-
-      // No matches = no score
-      if (matchedCount === 0) return 0;
-
-      // Calculate score:
-      // - Base: 10 points per specific word matched
-      // - Bonus: Higher percentage of title words matched = better
-      // - Penalty: Unmatched words in title reduce score (prevents "Bergkristall" beating "Bergkristall Geod")
-
-      const matchRatio = matchedCount / titleWords.length;
-      const unmatchedWords = titleWords.length - matchedCount;
-
-      let score = 0;
-      score += specificMatchCount * 20; // 20 points per specific word
-      score += matchedCount * 5; // 5 points per any word
-      score += matchRatio * 100; // Up to 100 points for full match
-      score -= unmatchedWords * 15; // Penalty for unmatched words in title
-
-      return Math.max(0, score);
-    }
-
-    // Find the product that best matches what the AI mentioned
+    // Find the product that matches the tag
     let productCards = [];
 
-    let bestMatch = null;
-    let bestScore = 0;
+    if (taggedProductName) {
+      // First try exact match (case-insensitive)
+      let matchedProduct = storeData.items.find((item) => {
+        if (item.type !== "product") return false;
+        if (!item.url || !item.image_url) return false;
+        return item.title.toLowerCase() === taggedProductName.toLowerCase();
+      });
 
-    for (const item of storeData.items) {
-      if (item.type !== "product") continue;
-      if (!item.url || !item.image_url) continue;
+      // If no exact match, try partial match (tag contained in title or vice versa)
+      if (!matchedProduct) {
+        const tagLower = taggedProductName.toLowerCase();
+        matchedProduct = storeData.items.find((item) => {
+          if (item.type !== "product") return false;
+          if (!item.url || !item.image_url) return false;
+          const titleLower = item.title.toLowerCase();
+          return titleLower.includes(tagLower) || tagLower.includes(titleLower);
+        });
+      }
 
-      const score = calculateProductMatchScore(item, answerLower);
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = item;
+      if (matchedProduct) {
+        productCards = [
+          {
+            title: matchedProduct.title,
+            url: matchedProduct.url,
+            image_url: matchedProduct.image_url,
+            price: matchedProduct.price || null,
+          },
+        ];
       }
     }
 
-    // Only show card if we have a meaningful match
-    if (bestMatch && bestScore >= 10) {
-      productCards = [
-        {
-          title: bestMatch.title,
-          url: bestMatch.url,
-          image_url: bestMatch.image_url,
-          price: bestMatch.price || null,
-        },
-      ];
+    // Fallback: If no tag or no match found, use the old scoring method
+    if (productCards.length === 0 && !taggedProductName) {
+      const answerLower = answer.toLowerCase();
+
+      // Simple fallback: find if any product name appears in the answer
+      for (const item of storeData.items) {
+        if (item.type !== "product") continue;
+        if (!item.url || !item.image_url) continue;
+
+        // Check if product title words appear in answer
+        const titleWords = item.title
+          .toLowerCase()
+          .split(/[\s\-–—\|,]+/)
+          .filter((w) => w.length >= 4);
+        const specificWords = titleWords.filter(
+          (w) =>
+            ![
+              "sten",
+              "stone",
+              "crystal",
+              "kristall",
+              "cuddle",
+              "cluster",
+              "kluster",
+            ].includes(w)
+        );
+
+        if (
+          specificWords.length > 0 &&
+          specificWords.some((w) => answerLower.includes(w))
+        ) {
+          productCards = [
+            {
+              title: item.title,
+              url: item.url,
+              image_url: item.image_url,
+              price: item.price || null,
+            },
+          ];
+          break;
+        }
+      }
     }
 
     // Save assistant response
@@ -510,6 +560,12 @@ Example BAD response:
         products_found: relevantProducts.length,
         pages_found: relevantPages.length,
         contact_info_included: queryContext.isContactQuery,
+        product_tag_found: taggedProductName || null,
+        product_match_method: taggedProductName
+          ? productCards.length > 0
+            ? "structured_output"
+            : "tag_not_matched"
+          : "fallback",
         best_product_score: bestProductScore.toFixed(3),
         top_products: relevantProducts.slice(0, 3).map((e) => ({
           title: e.item.title,

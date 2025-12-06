@@ -15,6 +15,7 @@ const { initDb } = require("./config/database");
 const storeRoutes = require("./routes/store");
 const chatRoutes = require("./routes/chat");
 const analyticsRoutes = require("./routes/analytics");
+const adminRoutes = require("./routes/admin");
 
 // Import services for scheduled tasks
 const {
@@ -50,6 +51,9 @@ app.use("/", chatRoutes);
 // Analytics routes (overview, conversations, ask)
 app.use("/analytics", analyticsRoutes);
 
+// Admin routes (license key management) - protected by admin secret
+app.use("/admin", adminRoutes);
+
 // =============================================================================
 // SCHEDULED TASKS
 // =============================================================================
@@ -82,4 +86,5 @@ initDb();
 
 app.listen(PORT, () => {
   console.log(`🚀 RUMI Backend running on http://localhost:${PORT}`);
+  console.log(`📊 Admin API available at /admin (requires X-Admin-Key header)`);
 });

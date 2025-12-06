@@ -166,6 +166,98 @@ async function initDb() {
       );
     `);
 
+    // =============================================================================
+    // API KEYS & LICENSING SYSTEM
+    // =============================================================================
+
+    // License keys table (provider-level keys)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS license_keys (
+        id SERIAL PRIMARY KEY,
+        key_hash TEXT UNIQUE NOT NULL,
+        key_prefix TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        owner_name TEXT,
+        plan TEXT NOT NULL DEFAULT 'free',
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        billing_cycle_start TIMESTAMPTZ DEFAULT now(),
+        last_used_at TIMESTAMPTZ,
+        allowed_domains TEXT[],
+        metadata JSONB DEFAULT '{}'
+      );
+    `);
+
+    // Add indexes for license_keys
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_license_keys_key_hash ON license_keys(key_hash);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_license_keys_owner_email ON license_keys(owner_email);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_license_keys_plan ON license_keys(plan);`
+    );
+
+    // Plan limits configuration
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS plan_limits (
+        id SERIAL PRIMARY KEY,
+        plan_name TEXT UNIQUE NOT NULL,
+        display_name TEXT NOT NULL,
+        conversations_per_month INTEGER,
+        price_monthly DECIMAL(10,2),
+        features JSONB DEFAULT '{}',
+        is_active BOOLEAN DEFAULT true
+      );
+    `);
+
+    // Insert default plans (upsert)
+    await pool.query(`
+      INSERT INTO plan_limits (plan_name, display_name, conversations_per_month, price_monthly, features) VALUES
+        ('free', 'Free', 10, 0, '{"analytics": false, "priority_support": false}'),
+        ('starter', 'Starter', 75, 9.00, '{"analytics": true, "priority_support": false}'),
+        ('pro', 'Pro', 500, 29.00, '{"analytics": true, "priority_support": false}'),
+        ('business', 'Business', 1000, 49.00, '{"analytics": true, "priority_support": true}'),
+        ('unlimited', 'Unlimited', NULL, 149.00, '{"analytics": true, "priority_support": true}')
+      ON CONFLICT (plan_name) DO UPDATE SET
+        display_name = EXCLUDED.display_name,
+        conversations_per_month = EXCLUDED.conversations_per_month,
+        price_monthly = EXCLUDED.price_monthly,
+        features = EXCLUDED.features;
+    `);
+
+    // Usage tracking table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS usage_tracking (
+        id SERIAL PRIMARY KEY,
+        license_key_id INTEGER NOT NULL REFERENCES license_keys(id) ON DELETE CASCADE,
+        store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+        period_start TIMESTAMPTZ NOT NULL,
+        period_end TIMESTAMPTZ NOT NULL,
+        conversations_used INTEGER DEFAULT 0,
+        messages_sent INTEGER DEFAULT 0,
+        api_calls INTEGER DEFAULT 0,
+        estimated_cost DECIMAL(10,4) DEFAULT 0,
+        UNIQUE (license_key_id, period_start)
+      );
+    `);
+
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_usage_tracking_license_key_id ON usage_tracking(license_key_id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_usage_tracking_period ON usage_tracking(period_start, period_end);`
+    );
+
+    // Link stores to license keys
+    await pool.query(
+      `ALTER TABLE stores ADD COLUMN IF NOT EXISTS license_key_id INTEGER REFERENCES license_keys(id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_stores_license_key_id ON stores(license_key_id);`
+    );
+
     console.log("✅ Database initialized");
   } catch (err) {
     console.error("❌ Database initialization error:", err);

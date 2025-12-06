@@ -2,6 +2,7 @@
  * Store Routes
  *
  * Handles store registration, indexing, and settings.
+ * All routes require a valid license key.
  */
 
 const express = require("express");
@@ -13,17 +14,41 @@ const {
   buildItemsForEmbedding,
   extractFactsFromText,
 } = require("../services/embedding");
+const {
+  validateLicenseKey,
+  getLicenseKeyId,
+  linkStoreToLicense,
+  getUsageStats,
+} = require("../services/license");
 
 /**
  * Register a new store
+ * Requires: license_key, site_url, admin_email
  */
 router.post("/register-store", async (req, res) => {
   const {
+    license_key,
     site_url,
     store_name,
     admin_email,
     personality = {},
   } = req.body || {};
+
+  // Validate license key first
+  if (!license_key) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "license_key is required" });
+  }
+
+  const licenseValidation = await validateLicenseKey(license_key, site_url);
+  if (!licenseValidation.valid) {
+    return res.status(401).json({
+      ok: false,
+      error: licenseValidation.error,
+      message: licenseValidation.message,
+    });
+  }
 
   if (!site_url || !admin_email) {
     return res
@@ -32,15 +57,17 @@ router.post("/register-store", async (req, res) => {
   }
 
   try {
+    const licenseKeyId = await getLicenseKeyId(license_key);
+
     const result = await pool.query(
-      `INSERT INTO stores (store_id, api_key, site_url, store_name, admin_email, personality)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO stores (store_id, api_key, site_url, store_name, admin_email, personality, license_key_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (site_url)
        DO UPDATE SET
-         api_key = EXCLUDED.api_key,
          store_name = EXCLUDED.store_name,
          admin_email = EXCLUDED.admin_email,
-         personality = EXCLUDED.personality
+         personality = EXCLUDED.personality,
+         license_key_id = EXCLUDED.license_key_id
        RETURNING id, store_id, api_key`,
       [
         generateStoreId(),
@@ -49,6 +76,7 @@ router.post("/register-store", async (req, res) => {
         store_name || null,
         admin_email,
         personality,
+        licenseKeyId,
       ]
     );
 
@@ -57,6 +85,7 @@ router.post("/register-store", async (req, res) => {
       ok: true,
       store_id: row.store_id,
       api_key: row.api_key,
+      license: licenseValidation.license,
       message: "Store registered successfully",
     });
   } catch (err) {
@@ -121,6 +150,27 @@ router.post("/index-store", async (req, res) => {
       .json({ ok: false, error: "store_id and api_key are required" });
   }
 
+  // Verify store exists and get license info
+  const storeCheck = await pool.query(
+    `SELECT s.id, s.license_key_id, lk.is_active as license_active
+     FROM stores s
+     LEFT JOIN license_keys lk ON s.license_key_id = lk.id
+     WHERE s.store_id = $1 AND s.api_key = $2`,
+    [store_id, api_key]
+  );
+
+  if (storeCheck.rowCount === 0) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Invalid store_id or api_key" });
+  }
+
+  if (storeCheck.rows[0].license_key_id && !storeCheck.rows[0].license_active) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "License key has been deactivated" });
+  }
+
   const items = buildItemsForEmbedding(products, pages);
   const texts = items.map((item) => item.text);
 
@@ -168,99 +218,92 @@ router.post("/index-store", async (req, res) => {
     });
 
     // Persist to database
-    const storeRow = await pool.query(
-      "SELECT id FROM stores WHERE store_id = $1",
-      [store_id]
+    const storeDbId = storeCheck.rows[0].id;
+
+    // Clear existing items and facts
+    await pool.query("DELETE FROM store_items WHERE store_id = $1", [
+      storeDbId,
+    ]);
+    await pool.query("DELETE FROM store_facts WHERE store_id = $1", [
+      storeDbId,
+    ]);
+
+    console.log(
+      `Cleared existing items for store_id=${store_id}, inserting ${embeddedItems.length} new items`
     );
 
-    if (storeRow.rowCount > 0) {
-      const storeDbId = storeRow.rows[0].id;
-
-      // Clear existing items and facts
-      await pool.query("DELETE FROM store_items WHERE store_id = $1", [
-        storeDbId,
-      ]);
-      await pool.query("DELETE FROM store_facts WHERE store_id = $1", [
-        storeDbId,
-      ]);
-
-      console.log(
-        `Cleared existing items for store_id=${store_id}, inserting ${embeddedItems.length} new items`
-      );
-
-      // Add manual contact info
-      if (contact_info.email) {
-        await pool.query(
-          `INSERT INTO store_facts (store_id, fact_type, key, value)
-           VALUES ($1, 'email', 'manual', $2)
-           ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
-          [storeDbId, contact_info.email]
-        );
-      }
-      if (contact_info.phone) {
-        await pool.query(
-          `INSERT INTO store_facts (store_id, fact_type, key, value)
-           VALUES ($1, 'phone', 'manual', $2)
-           ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
-          [storeDbId, contact_info.phone]
-        );
-      }
-      if (contact_info.address) {
-        await pool.query(
-          `INSERT INTO store_facts (store_id, fact_type, key, value)
-           VALUES ($1, 'address', 'manual', $2)
-           ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
-          [storeDbId, contact_info.address]
-        );
-      }
-
-      const hasManualEmail = !!contact_info.email;
-      const hasManualPhone = !!contact_info.phone;
-
-      for (const item of embeddedItems) {
-        const itemRes = await pool.query(
-          `INSERT INTO store_items (store_id, external_id, type, title, url, image_url, content, embedding, price, stock_status, in_stock)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           RETURNING id`,
-          [
-            storeDbId,
-            item.item_id,
-            item.type,
-            item.title,
-            item.url,
-            item.image_url,
-            item.text,
-            item.embedding,
-            item.price,
-            item.stock_status,
-            item.in_stock,
-          ]
-        );
-
-        const storeItemId = itemRes.rows[0].id;
-
-        // Extract contact facts from content if no manual ones
-        if (!hasManualEmail || !hasManualPhone) {
-          const facts = extractFactsFromText(item.text);
-
-          for (const fact of facts) {
-            if (fact.fact_type === "email" && hasManualEmail) continue;
-            if (fact.fact_type === "phone" && hasManualPhone) continue;
-
-            await pool.query(
-              `INSERT INTO store_facts (store_id, source_item_id, fact_type, key, value)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
-              [storeDbId, storeItemId, fact.fact_type, fact.key, fact.value]
-            );
-          }
-        }
-      }
-
-      console.log(
-        `Persisted ${embeddedItems.length} items for store_id=${store_id}`
+    // Add manual contact info
+    if (contact_info.email) {
+      await pool.query(
+        `INSERT INTO store_facts (store_id, fact_type, key, value)
+         VALUES ($1, 'email', 'manual', $2)
+         ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
+        [storeDbId, contact_info.email]
       );
     }
+    if (contact_info.phone) {
+      await pool.query(
+        `INSERT INTO store_facts (store_id, fact_type, key, value)
+         VALUES ($1, 'phone', 'manual', $2)
+         ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
+        [storeDbId, contact_info.phone]
+      );
+    }
+    if (contact_info.address) {
+      await pool.query(
+        `INSERT INTO store_facts (store_id, fact_type, key, value)
+         VALUES ($1, 'address', 'manual', $2)
+         ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
+        [storeDbId, contact_info.address]
+      );
+    }
+
+    const hasManualEmail = !!contact_info.email;
+    const hasManualPhone = !!contact_info.phone;
+
+    for (const item of embeddedItems) {
+      const itemRes = await pool.query(
+        `INSERT INTO store_items (store_id, external_id, type, title, url, image_url, content, embedding, price, stock_status, in_stock)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id`,
+        [
+          storeDbId,
+          item.item_id,
+          item.type,
+          item.title,
+          item.url,
+          item.image_url,
+          item.text,
+          item.embedding,
+          item.price,
+          item.stock_status,
+          item.in_stock,
+        ]
+      );
+
+      const storeItemId = itemRes.rows[0].id;
+
+      // Extract contact facts from content if no manual ones
+      if (!hasManualEmail || !hasManualPhone) {
+        const facts = extractFactsFromText(item.text);
+
+        for (const fact of facts) {
+          if (fact.fact_type === "email" && hasManualEmail) continue;
+          if (fact.fact_type === "phone" && hasManualPhone) continue;
+
+          await pool.query(
+            `INSERT INTO store_facts (store_id, source_item_id, fact_type, key, value)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (store_id, fact_type, value) DO NOTHING`,
+            [storeDbId, storeItemId, fact.fact_type, fact.key, fact.value]
+          );
+        }
+      }
+    }
+
+    console.log(
+      `Persisted ${embeddedItems.length} items for store_id=${store_id}`
+    );
 
     return res.json({
       ok: true,
@@ -346,6 +389,27 @@ router.get("/index-status", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, error: "Failed to get index status" });
+  }
+});
+
+/**
+ * Get usage stats for a license key (store owner endpoint)
+ */
+router.get("/usage-stats", async (req, res) => {
+  const { license_key } = req.query || {};
+
+  if (!license_key) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "license_key is required" });
+  }
+
+  const stats = await getUsageStats(license_key);
+
+  if (stats.success) {
+    return res.json({ ok: true, ...stats });
+  } else {
+    return res.status(400).json({ ok: false, error: stats.error });
   }
 });
 
