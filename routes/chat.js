@@ -1,7 +1,11 @@
 /**
- * Chat Routes
+ * Chat Routes (Refactored)
  *
- * Handles the main chat endpoint and conversation lifecycle.
+ * Smart conversational AI with:
+ * - Intent classification
+ * - Conversation state tracking
+ * - Dynamic prompt building
+ * - Context-aware responses
  */
 
 const express = require("express");
@@ -12,7 +16,20 @@ const {
   embedTexts,
   cosineSimilarity,
 } = require("../services/embedding");
-const { analyzeQuery } = require("../utils/helpers");
+const {
+  classifyIntent,
+  INTENTS,
+  describeIntent,
+} = require("../services/intent-classifier");
+const {
+  buildConversationState,
+  getFollowUpContext,
+  JOURNEY_STAGES,
+} = require("../services/conversation-state");
+const {
+  buildSystemPrompt,
+  buildContextMessage,
+} = require("../services/prompt-builder");
 const {
   getOrCreateConversation,
   saveConversationMessage,
@@ -27,7 +44,7 @@ const {
 } = require("../services/license");
 
 /**
- * Load store data from database (includes license info)
+ * Load store data from database
  */
 async function loadStoreDataFromDb(storeId) {
   try {
@@ -103,6 +120,194 @@ async function loadStoreFactsFromDb(storeId) {
 }
 
 /**
+ * Determine language from various sources
+ */
+function determineLanguage(language, personality) {
+  if (language === "sv" || language === "Swedish") return "Swedish";
+  if (language === "en" || language === "English") return "English";
+  if (personality?.language === "sv") return "Swedish";
+  if (personality?.language === "en") return "English";
+  return "Swedish"; // Default
+}
+
+/**
+ * Check if we should skip RAG search for this intent
+ * Only skip for pure terminal intents (short messages that are just greetings/thanks/bye)
+ */
+function shouldSkipRag(intent, message) {
+  // Only skip RAG for these intents
+  if (![INTENTS.GREETING, INTENTS.GOODBYE, INTENTS.THANKS].includes(intent)) {
+    return false;
+  }
+
+  // Only skip if the message is short (pure greeting/thanks/bye)
+  // If the message is longer, it likely contains more content we should process
+  const wordCount = message.trim().split(/\s+/).length;
+  return wordCount <= 4; // "Hej" = 1, "Hej på dig!" = 3, but "Hej, jag är ny på kristaller" = 6
+}
+
+/**
+ * Get quick response for terminal intents (greetings, etc.)
+ */
+function getQuickResponse(intent, language, personality) {
+  const tone = personality?.tone || "friendly";
+
+  const responses = {
+    [INTENTS.GREETING]: {
+      Swedish: {
+        friendly: [
+          "Hej! 👋 Vad kan jag hjälpa dig med idag?",
+          "Hejsan! Vad letar du efter?",
+          "Hej! Kul att du tittar in, vad kan jag hjälpa dig hitta?",
+        ],
+        professional: [
+          "Välkommen! Hur kan jag vara till hjälp?",
+          "God dag! Vad kan jag assistera dig med?",
+        ],
+        casual: [
+          "Tjena! 👋 Vad kan jag göra för dig?",
+          "Tja! Vad letar du efter?",
+        ],
+        luxurious: [
+          "Välkommen! Det är ett nöje att assistera dig. Vad söker du?",
+          "God dag! Hur kan jag hjälpa dig idag?",
+        ],
+      },
+      English: {
+        friendly: [
+          "Hey there! 👋 What can I help you find today?",
+          "Hi! What are you looking for?",
+          "Hello! Great to see you, what can I help with?",
+        ],
+        professional: [
+          "Welcome! How may I assist you?",
+          "Good day! What can I help you with?",
+        ],
+        casual: [
+          "Hey! 👋 What's up? What can I do for you?",
+          "Hi! What are you looking for?",
+        ],
+        luxurious: [
+          "Welcome! It's my pleasure to assist you. What are you looking for?",
+          "Good day! How may I help you today?",
+        ],
+      },
+    },
+    [INTENTS.THANKS]: {
+      Swedish: {
+        friendly: [
+          "Så lite så! 😊 Är det något mer jag kan hjälpa dig med?",
+          "Ingen orsak! Hör av dig om du har fler frågor!",
+        ],
+        professional: [
+          "Tack själv! Tveka inte att höra av dig om du har fler frågor.",
+          "Det var så lite! Finns det något mer jag kan hjälpa dig med?",
+        ],
+        casual: [
+          "Inga problem! Säg till om det är något mer!",
+          "Lugnt! Hojta till om du undrar något mer!",
+        ],
+        luxurious: [
+          "Det är jag som tackar! Tveka inte att återkomma.",
+          "Tack själv! Det har varit ett nöje att hjälpa dig.",
+        ],
+      },
+      English: {
+        friendly: [
+          "You're welcome! 😊 Anything else I can help with?",
+          "No problem! Let me know if you have more questions!",
+        ],
+        professional: [
+          "You're welcome! Don't hesitate to reach out if you have more questions.",
+          "My pleasure! Is there anything else I can assist you with?",
+        ],
+        casual: [
+          "No worries! Holler if you need anything else!",
+          "Sure thing! Let me know if you need more help!",
+        ],
+        luxurious: [
+          "It's my pleasure! Don't hesitate to return anytime.",
+          "You're most welcome! It's been a pleasure assisting you.",
+        ],
+      },
+    },
+    [INTENTS.GOODBYE]: {
+      Swedish: {
+        friendly: [
+          "Hejdå! 👋 Ha en fin dag!",
+          "Ha det så bra! Välkommen tillbaka!",
+        ],
+        professional: [
+          "Tack för besöket! Ha en fortsatt trevlig dag.",
+          "På återseende! Välkommen tillbaka.",
+        ],
+        casual: ["Ha de! 👋 Ses!", "Hejdå! Ta hand om dig!"],
+        luxurious: [
+          "Tack för ditt besök! Önskar dig en underbar dag.",
+          "På återseende! Det har varit ett nöje.",
+        ],
+      },
+      English: {
+        friendly: [
+          "Bye! 👋 Have a great day!",
+          "Take care! Come back anytime!",
+        ],
+        professional: [
+          "Thank you for visiting! Have a wonderful day.",
+          "Goodbye! We look forward to seeing you again.",
+        ],
+        casual: ["Later! 👋 Take care!", "Bye! See ya!"],
+        luxurious: [
+          "Thank you for visiting! Wishing you a wonderful day.",
+          "Farewell! It's been a pleasure serving you.",
+        ],
+      },
+    },
+  };
+
+  const intentResponses = responses[intent];
+  if (!intentResponses) return null;
+
+  const langResponses = intentResponses[language];
+  if (!langResponses) return null;
+
+  const toneResponses = langResponses[tone] || langResponses.friendly;
+  return toneResponses[Math.floor(Math.random() * toneResponses.length)];
+}
+
+/**
+ * Find products matching a tag or name
+ */
+function findProductByTag(taggedName, items) {
+  if (!taggedName) return null;
+
+  const tagLower = taggedName.toLowerCase();
+
+  // Exact match first
+  let match = items.find(
+    (item) =>
+      item.type === "product" &&
+      item.url &&
+      item.image_url &&
+      item.title.toLowerCase() === tagLower
+  );
+
+  // Partial match fallback
+  if (!match) {
+    match = items.find(
+      (item) =>
+        item.type === "product" &&
+        item.url &&
+        item.image_url &&
+        (item.title.toLowerCase().includes(tagLower) ||
+          tagLower.includes(item.title.toLowerCase()))
+    );
+  }
+
+  return match;
+}
+
+/**
  * Main chat endpoint
  */
 router.post("/chat", async (req, res) => {
@@ -128,7 +333,7 @@ router.post("/chat", async (req, res) => {
       .json({ ok: false, error: "message cannot be empty" });
   }
 
-  // Load store data (includes license info)
+  // Load store data
   const storeData = await loadStoreDataFromDb(store_id);
   const storeFacts = await loadStoreFactsFromDb(store_id);
 
@@ -141,20 +346,18 @@ router.post("/chat", async (req, res) => {
       });
   }
 
-  // Check license status
+  // License checks
   if (storeData.licenseKeyId) {
     if (!storeData.licenseActive) {
       return res.status(403).json({
         ok: false,
         error: "license_deactivated",
-        message:
-          "This store's license has been deactivated. Please contact support.",
+        message: "This store's license has been deactivated.",
         show_to_customer:
           "Chatten är tillfälligt otillgänglig. Vänligen försök igen senare.",
       });
     }
 
-    // Check usage limits (if not unlimited)
     if (storeData.planLimit !== null) {
       const usageResult = await pool.query(
         `SELECT conversations_used FROM usage_tracking 
@@ -169,35 +372,43 @@ router.post("/chat", async (req, res) => {
         return res.status(403).json({
           ok: false,
           error: "limit_reached",
-          message: `Monthly conversation limit reached (${currentUsage}/${storeData.planLimit}). Please upgrade your plan.`,
+          message: `Monthly limit reached (${currentUsage}/${storeData.planLimit}).`,
           show_to_customer:
             "Chatten är tillfälligt otillgänglig. Vänligen försök igen senare.",
           upgrade_needed: true,
-          plan: storeData.plan,
         });
       }
     }
   }
 
-  // Get store database ID for conversation tracking
-  const storeDbId = await getStoreDbId(store_id);
-
   // Determine language
-  let userLanguage = "Swedish";
+  const userLanguage = determineLanguage(language, storeData.personality);
 
-  if (language === "sv" || language === "Swedish") {
-    userLanguage = "Swedish";
-  } else if (language === "en" || language === "English") {
-    userLanguage = "English";
-  } else if (storeData.personality?.language === "sv") {
-    userLanguage = "Swedish";
-  } else if (storeData.personality?.language === "en") {
-    userLanguage = "English";
+  // ============ INTENT CLASSIFICATION ============
+  // Build preliminary conversation state for intent classification
+  const preliminaryState = buildConversationState(history, message, {});
+  const currentIntent = classifyIntent(message, preliminaryState);
+
+  // Now build full state with intent
+  const conversationState = buildConversationState(
+    history,
+    message,
+    currentIntent
+  );
+  const followUpContext = getFollowUpContext(conversationState, currentIntent);
+
+  console.log(
+    `[Chat] Intent: ${currentIntent.primary} (${currentIntent.confidence}), Stage: ${conversationState.journeyStage}`
+  );
+  if (followUpContext.hasContext) {
+    console.log(`[Chat] Follow-up context:`, followUpContext.explanation);
   }
 
-  // Track conversation (check if this is a new conversation for billing)
+  // Track conversation
+  const storeDbId = await getStoreDbId(store_id);
   let conversation = null;
   let isNewConversation = false;
+
   if (storeDbId && session_id) {
     const existingConv = await pool.query(
       `SELECT id FROM conversations WHERE store_id = $1 AND session_id = $2`,
@@ -215,43 +426,29 @@ router.post("/chat", async (req, res) => {
       await saveConversationMessage(conversation.id, "user", message, []);
     }
 
-    // Increment conversation count for billing (only for new conversations)
     if (isNewConversation && storeData.licenseKeyId) {
       await incrementConversation(storeData.licenseKeyId, storeDbId);
     }
   }
 
-  // Track message for usage stats
   if (storeData.licenseKeyId) {
     await incrementMessage(storeData.licenseKeyId);
   }
 
-  try {
-    const queryContext = analyzeQuery(message, history, userLanguage);
+  // ============ QUICK RESPONSES FOR TERMINAL INTENTS ============
+  if (shouldSkipRag(currentIntent.primary, message)) {
+    const quickResponse = getQuickResponse(
+      currentIntent.primary,
+      userLanguage,
+      storeData.personality
+    );
 
-    // Handle greetings
-    if (queryContext.isGreeting) {
-      const greetings = {
-        Swedish: [
-          "Hej! 👋 Vad kan jag hjälpa dig med idag?",
-          "Hej hej! Vad letar du efter?",
-          "Hallå! Hur kan jag hjälpa dig?",
-        ],
-        English: [
-          "Hey there! 👋 What can I help you find today?",
-          "Hi! What are you looking for?",
-          "Hello! How can I help you?",
-        ],
-      };
-      const options = greetings[userLanguage];
-      const greetingResponse =
-        options[Math.floor(Math.random() * options.length)];
-
+    if (quickResponse) {
       if (conversation) {
         await saveConversationMessage(
           conversation.id,
           "assistant",
-          greetingResponse,
+          quickResponse,
           []
         );
       }
@@ -259,166 +456,160 @@ router.post("/chat", async (req, res) => {
       return res.json({
         ok: true,
         store_id,
-        answer: greetingResponse,
+        answer: quickResponse,
         product_cards: [],
+        debug: {
+          intent: currentIntent.primary,
+          intent_confidence: currentIntent.confidence,
+          journey_stage: conversationState.journeyStage,
+          quick_response: true,
+        },
       });
     }
+  }
 
-    // Embed the query
+  try {
+    // ============ RAG SEARCH ============
     const [queryVector] = await embedTexts([message]);
 
-    // Score all items (filter out out-of-stock products)
+    // Score all items
     const scored = storeData.items
-      .filter((item) => {
-        if (item.type !== "product") return true;
-        return item.in_stock !== false;
-      })
+      .filter((item) => item.type !== "product" || item.in_stock !== false)
       .map((item) => ({
         item,
         score: cosineSimilarity(queryVector, item.embedding),
-      }));
-    scored.sort((a, b) => b.score - a.score);
+      }))
+      .sort((a, b) => b.score - a.score);
 
-    // Separate products and pages
     const scoredProducts = scored.filter((s) => s.item.type === "product");
     const scoredPages = scored.filter((s) => s.item.type === "page");
 
-    // Dynamic thresholds
-    const productThreshold = queryContext.isVisual ? 0.32 : 0.38;
-    const pageThreshold = 0.45;
+    // Dynamic thresholds based on intent
+    let productThreshold = 0.38;
+    let pageThreshold = 0.45;
 
-    const relevantProducts = scoredProducts
+    if (
+      currentIntent.primary === INTENTS.BROWSE ||
+      currentIntent.primary === INTENTS.RECOMMENDATION
+    ) {
+      productThreshold = 0.32; // More lenient for browsing
+    }
+    if (
+      currentIntent.primary === INTENTS.PRODUCT_INFO &&
+      conversationState.lastProducts.length > 0
+    ) {
+      productThreshold = 0.3; // Very lenient if following up on a product
+    }
+
+    let relevantProducts = scoredProducts
       .filter((s) => s.score >= productThreshold)
       .slice(0, 5);
-    const relevantPages = scoredPages
+    let relevantPages = scoredPages
       .filter((s) => s.score >= pageThreshold)
       .slice(0, 2);
 
-    // Build context for AI
-    let context = "";
+    // ============ "MORE" REQUEST HANDLING ============
+    // If user asks for "more" of something, include more products from the same category
+    const isMoreRequest =
+      /\b(fler|mer|more|annat|andra|other|alternatives)\b/i.test(message);
 
-    if (relevantProducts.length > 0) {
-      context += "## PRODUCTS (all in stock)\n\n";
-      relevantProducts.forEach((e) => {
-        context += `**${e.item.title}**\n`;
-        if (e.item.price) context += `Price: ${e.item.price}\n`;
-        if (e.item.content) {
-          const desc =
-            e.item.content.length > 400
-              ? e.item.content.slice(0, 400) + "..."
-              : e.item.content;
-          context += `${desc}\n`;
+    if (isMoreRequest && conversationState.lastProducts.length > 0) {
+      // Extract key words from last products to find related items
+      const lastProductNames = conversationState.lastProducts.map((p) =>
+        p.toLowerCase()
+      );
+      const keyWords = [];
+
+      for (const name of lastProductNames) {
+        // Extract significant words (likely product type/category)
+        const words = name.split(/[\s\-–—\|,]+/).filter((w) => w.length >= 4);
+        keyWords.push(...words);
+      }
+
+      // Find more products matching these keywords
+      for (const item of storeData.items) {
+        if (item.type !== "product") continue;
+        if (!item.url || !item.image_url) continue;
+
+        const titleLower = item.title.toLowerCase();
+        const alreadyIncluded = relevantProducts.some(
+          (p) => p.item.title.toLowerCase() === titleLower
+        );
+
+        if (!alreadyIncluded) {
+          // Check if this product matches any key words
+          const matches = keyWords.some((kw) => titleLower.includes(kw));
+          if (matches) {
+            relevantProducts.push({
+              item,
+              score: 0.7,
+              boosted: true,
+              reason: "category_match",
+            });
+          }
         }
-        // Don't include URL - the AI shouldn't output links
-        context += "\n";
-      });
+      }
+
+      // Limit to 8 products for "more" requests
+      relevantProducts = relevantProducts.slice(0, 8);
     }
 
-    if (relevantPages.length > 0) {
-      context += "## STORE INFORMATION\n\n";
-      relevantPages.forEach((e) => {
-        context += `### ${e.item.title}\n${
-          e.item.content?.slice(0, 500) || ""
-        }\n\n`;
-      });
+    // ============ CONTEXT-AWARE PRODUCT BOOSTING ============
+    // If user is following up on a product, ensure it's in the context
+    if (
+      conversationState.lastProducts.length > 0 &&
+      [
+        INTENTS.AFFIRMATIVE,
+        INTENTS.PRODUCT_INFO,
+        INTENTS.PRICE_CHECK,
+        INTENTS.PURCHASE,
+      ].includes(currentIntent.primary)
+    ) {
+      for (const productName of conversationState.lastProducts) {
+        const alreadyIncluded = relevantProducts.some(
+          (p) => p.item.title.toLowerCase() === productName.toLowerCase()
+        );
+
+        if (!alreadyIncluded) {
+          const productData = storeData.items.find(
+            (item) =>
+              item.type === "product" &&
+              item.title.toLowerCase() === productName.toLowerCase()
+          );
+
+          if (productData) {
+            relevantProducts.unshift({
+              item: productData,
+              score: 1.0,
+              boosted: true,
+            });
+          }
+        }
+      }
     }
 
-    // Only add contact info if the query seems contact-related
-    if (queryContext.isContactQuery && storeFacts.length > 0) {
-      context += "## CONTACT INFO (user asked about this)\n";
-      storeFacts.forEach((f) => {
-        context += `${f.fact_type}: ${f.value}\n`;
-      });
-      context += "\n";
-    }
-
-    // Build messages for AI
-    const personality = storeData.personality || {};
-    const toneDescriptions = {
-      friendly:
-        "warm, approachable, and helpful, like a favorite local shopkeeper",
-      professional:
-        "knowledgeable, polished, and courteous with a touch of warmth",
-      casual: "relaxed and conversational, like chatting with a friend",
-      luxurious:
-        "refined, attentive, and elegant, providing a premium experience",
-    };
-
-    const systemPrompt = `You are a helpful store assistant for ${
-      storeData.storeName || "this store"
-    }.
-
-## LANGUAGE - CRITICAL
-You MUST respond in ${userLanguage}. Always. Every single response must be in ${userLanguage}.
-
-## YOUR PERSONALITY
-Tone: ${toneDescriptions[personality.tone] || toneDescriptions.friendly}
-${personality.brand_voice ? `Brand voice: ${personality.brand_voice}` : ""}
-${
-  personality.special_instructions
-    ? `Special instructions: ${personality.special_instructions}`
-    : ""
-}
-
-## RESPONSE STYLE - VERY IMPORTANT
-Keep responses SHORT and conversational:
-- 1-2 sentences for simple questions
-- 3-4 sentences maximum for complex questions
-- Never write long paragraphs or walls of text
-- Chat like a helpful friend, not a formal assistant
-- Be natural and warm, not robotic
-
-## THINGS YOU MUST NEVER DO
-- NEVER include URLs or links in your response
-- NEVER use markdown link format like [text](url)
-- NEVER list out contact information unless the user specifically asks for it
-- NEVER output product URLs - product cards with links appear automatically
-- If someone MIGHT want contact info but didn't explicitly ask, offer first: "Vill du ha våra kontaktuppgifter?" / "Would you like our contact details?"
-
-## PRODUCT TAG - CRITICAL
-When you mention or recommend a product, you MUST end your response with the exact product name in double curly braces.
-This tag is used by the system to show the correct product card. Use the EXACT product name from the store data.
-
-Format: {{Exact Product Name}}
-
-Examples:
-- "Rosenkvarts Cuddle Stone skulle passa perfekt för det! Den är lugn och fin. {{Rosenkvarts Cuddle Stone}}"
-- "Den har vackra glittrande kristaller inuti. {{Bergkristall Geod}}"
-- "Vi har två alternativ - Malakit Sten för 150 kr eller det exklusiva Malakit Stalaktit Specimen. {{Malakit Sten}}"
-
-Rules for the product tag:
-- Always place it at the very end of your response
-- Use the EXACT name as it appears in the product list
-- Only include ONE product in the tag (the main/primary recommendation)
-- If you're answering a follow-up about a previously discussed product, still include the tag
-- If you're NOT recommending any specific product, don't include any tag
-
-## RULES
-- Answer based ONLY on the store data provided
-- If you don't know something, say so briefly and politely
-- Never make up information about products or policies
-
-## HANDLING FOLLOW-UP QUESTIONS
-- When the user says "it", "that one", "den", "det", etc., check the conversation history
-- Look for "[You showed product cards for: ...]" notes to see what products were just discussed
-- Connect their question to the most recently mentioned/shown product
-- Still include the {{Product Name}} tag at the end`;
+    // ============ BUILD PROMPT ============
+    const systemPrompt = buildSystemPrompt({
+      storeName: storeData.storeName,
+      personality: storeData.personality,
+      language: userLanguage,
+      conversationState,
+      currentIntent,
+      hasProductContext: relevantProducts.length > 0,
+      hasContactInfo: storeFacts.length > 0,
+    });
 
     const messages = [{ role: "system", content: systemPrompt }];
 
     // Add conversation history with product context
     if (history.length > 0) {
-      history.slice(-6).forEach((h) => {
-        if (
-          h.role === "assistant" &&
-          h.products_shown &&
-          h.products_shown.length > 0
-        ) {
-          // Include what products were shown/discussed with this response
-          const productContext = h.products_shown.join(", ");
+      history.slice(-8).forEach((h) => {
+        if (h.role === "assistant" && h.products_shown?.length > 0) {
           messages.push({
             role: h.role,
-            content: `${h.content}\n[You showed product cards for: ${productContext}]`,
+            content: `${h.content}\n[Products shown: ${h.products_shown.join(
+              ", "
+            )}]`,
           });
         } else {
           messages.push({ role: h.role, content: h.content });
@@ -426,115 +617,158 @@ Rules for the product tag:
       });
     }
 
+    // Add current message
     messages.push({ role: "user", content: message });
 
     // Add RAG context
     const bestProductScore = relevantProducts[0]?.score || 0;
     const confidenceNote =
-      bestProductScore < 0.45 && queryContext.isProductQuery
+      bestProductScore < 0.45 &&
+      [INTENTS.SEARCH, INTENTS.PRODUCT_INFO].includes(currentIntent.primary)
         ? "\n\n⚠️ Note: These results aren't a strong match. Be honest if nothing fits well."
         : "";
 
-    messages.push({
-      role: "user",
-      content: `[STORE DATA - use this to answer the customer's question]\n\n${context}${confidenceNote}`,
+    const contextMessage = buildContextMessage({
+      products: relevantProducts,
+      pages: relevantPages,
+      facts: storeFacts,
+      conversationState,
+      currentIntent,
+      confidenceNote,
     });
 
-    // Call OpenAI
+    messages.push({ role: "user", content: contextMessage });
+
+    // ============ CALL AI ============
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages,
-      temperature: 0.5,
-      max_tokens: 250,
+      temperature: 0.6, // Slightly higher for more natural responses
+      max_tokens: 300,
     });
 
     const rawAnswer =
       completion.choices[0]?.message?.content ||
       "Sorry, I couldn't generate a response.";
 
-    // Extract product tag from response: {{Product Name}}
-    const productTagMatch = rawAnswer.match(/\{\{([^}]+)\}\}/);
-    const taggedProductName = productTagMatch
-      ? productTagMatch[1].trim()
-      : null;
+    // Extract all product tags (supports multiple: {{Product1}} {{Product2}})
+    const productTagMatches = rawAnswer.match(/\{\{([^}]+)\}\}/g) || [];
+    const taggedProductNames = productTagMatches.map((tag) =>
+      tag.replace(/\{\{|\}\}/g, "").trim()
+    );
 
-    // Remove the tag from the displayed answer
-    const answer = rawAnswer.replace(/\s*\{\{[^}]+\}\}\s*$/, "").trim();
+    // Remove all tags from the displayed answer
+    const answer = rawAnswer.replace(/\s*\{\{[^}]+\}\}/g, "").trim();
 
-    // Find the product that matches the tag
+    // ============ PRODUCT CARD SELECTION ============
     let productCards = [];
 
-    if (taggedProductName) {
-      // First try exact match (case-insensitive)
-      let matchedProduct = storeData.items.find((item) => {
-        if (item.type !== "product") return false;
-        if (!item.url || !item.image_url) return false;
-        return item.title.toLowerCase() === taggedProductName.toLowerCase();
-      });
-
-      // If no exact match, try partial match (tag contained in title or vice versa)
-      if (!matchedProduct) {
-        const tagLower = taggedProductName.toLowerCase();
-        matchedProduct = storeData.items.find((item) => {
-          if (item.type !== "product") return false;
-          if (!item.url || !item.image_url) return false;
-          const titleLower = item.title.toLowerCase();
-          return titleLower.includes(tagLower) || tagLower.includes(titleLower);
-        });
+    // Find all tagged products (max 2 cards)
+    if (taggedProductNames.length > 0) {
+      for (const taggedName of taggedProductNames.slice(0, 2)) {
+        const matchedProduct = findProductByTag(taggedName, storeData.items);
+        if (matchedProduct) {
+          // Avoid duplicates
+          const alreadyAdded = productCards.some(
+            (p) => p.title === matchedProduct.title
+          );
+          if (!alreadyAdded) {
+            productCards.push({
+              title: matchedProduct.title,
+              url: matchedProduct.url,
+              image_url: matchedProduct.image_url,
+              price: matchedProduct.price || null,
+            });
+          }
+        }
       }
+    }
 
-      if (matchedProduct) {
+    // Fallback: If affirmative response about a known product, show that product
+    if (
+      productCards.length === 0 &&
+      currentIntent.primary === INTENTS.AFFIRMATIVE &&
+      conversationState.lastProducts.length > 0
+    ) {
+      const lastProduct = findProductByTag(
+        conversationState.lastProducts[0],
+        storeData.items
+      );
+      if (lastProduct) {
         productCards = [
           {
-            title: matchedProduct.title,
-            url: matchedProduct.url,
-            image_url: matchedProduct.image_url,
-            price: matchedProduct.price || null,
+            title: lastProduct.title,
+            url: lastProduct.url,
+            image_url: lastProduct.image_url,
+            price: lastProduct.price || null,
           },
         ];
       }
     }
 
-    // Fallback: If no tag or no match found, use the old scoring method
-    if (productCards.length === 0 && !taggedProductName) {
+    // Fallback 2: If still no cards but AI mentioned products, try to find them in the response
+    if (productCards.length === 0) {
       const answerLower = answer.toLowerCase();
 
-      // Simple fallback: find if any product name appears in the answer
+      // Look for products mentioned in the answer
       for (const item of storeData.items) {
         if (item.type !== "product") continue;
         if (!item.url || !item.image_url) continue;
 
-        // Check if product title words appear in answer
-        const titleWords = item.title
-          .toLowerCase()
-          .split(/[\s\-–—\|,]+/)
-          .filter((w) => w.length >= 4);
-        const specificWords = titleWords.filter(
-          (w) =>
-            ![
-              "sten",
-              "stone",
-              "crystal",
-              "kristall",
-              "cuddle",
-              "cluster",
-              "kluster",
-            ].includes(w)
-        );
+        // Check if the product title appears in the answer
+        const titleLower = item.title.toLowerCase();
 
-        if (
-          specificWords.length > 0 &&
-          specificWords.some((w) => answerLower.includes(w))
-        ) {
-          productCards = [
-            {
+        // For longer titles, check if they appear in the answer
+        if (titleLower.length >= 8 && answerLower.includes(titleLower)) {
+          productCards.push({
+            title: item.title,
+            url: item.url,
+            image_url: item.image_url,
+            price: item.price || null,
+          });
+          if (productCards.length >= 2) break;
+        }
+      }
+
+      // If still nothing, try matching significant words from product titles
+      if (productCards.length === 0) {
+        for (const item of storeData.items) {
+          if (item.type !== "product") continue;
+          if (!item.url || !item.image_url) continue;
+
+          // Extract significant words (4+ chars, not common words)
+          const commonWords = [
+            "sten",
+            "stone",
+            "crystal",
+            "kristall",
+            "stor",
+            "liten",
+            "lila",
+            "svart",
+            "vit",
+            "blå",
+            "rosa",
+            "grön",
+          ];
+          const titleWords = item.title
+            .toLowerCase()
+            .split(/[\s\-–—\|,]+/)
+            .filter((w) => w.length >= 4 && !commonWords.includes(w));
+
+          // If any significant word from the title appears in the answer
+          if (
+            titleWords.length > 0 &&
+            titleWords.some((w) => answerLower.includes(w))
+          ) {
+            productCards.push({
               title: item.title,
               url: item.url,
               image_url: item.image_url,
               price: item.price || null,
-            },
-          ];
-          break;
+            });
+            if (productCards.length >= 2) break;
+          }
         }
       }
     }
@@ -556,20 +790,23 @@ Rules for the product tag:
       answer,
       product_cards: productCards,
       debug: {
-        query: queryContext,
+        intent: currentIntent.primary,
+        intent_confidence: currentIntent.confidence,
+        intent_description: describeIntent(currentIntent.primary),
+        journey_stage: conversationState.journeyStage,
+        context_summary: conversationState.contextSummary,
+        follow_up: followUpContext.hasContext
+          ? followUpContext.explanation
+          : null,
         products_found: relevantProducts.length,
         pages_found: relevantPages.length,
-        contact_info_included: queryContext.isContactQuery,
-        product_tag_found: taggedProductName || null,
-        product_match_method: taggedProductName
-          ? productCards.length > 0
-            ? "structured_output"
-            : "tag_not_matched"
-          : "fallback",
-        best_product_score: bestProductScore.toFixed(3),
+        product_tags: taggedProductNames.length > 0 ? taggedProductNames : null,
+        products_matched: productCards.length,
+        best_score: bestProductScore.toFixed(3),
         top_products: relevantProducts.slice(0, 3).map((e) => ({
           title: e.item.title,
           score: e.score.toFixed(3),
+          boosted: e.boosted || false,
         })),
       },
     });
@@ -610,10 +847,9 @@ router.post("/end-conversation", async (req, res) => {
     if (result.rowCount > 0) {
       const conv = result.rows[0];
       console.log(
-        `Conversation ${conv.id} ended (chat closed, ${conv.message_count} messages)`
+        `Conversation ${conv.id} ended (${conv.message_count} messages)`
       );
 
-      // Trigger insight extraction asynchronously
       if (conv.message_count >= 2) {
         setImmediate(() => {
           extractInsightsFromConversation(conv.id, storeDbId);
