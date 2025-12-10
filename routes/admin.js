@@ -294,50 +294,6 @@ router.get("/plans", async (req, res) => {
 });
 
 // =============================================================================
-// DATABASE MIGRATIONS
-// =============================================================================
-
-/**
- * Run database migration for quality scoring
- * POST /admin/run-migration
- */
-router.post("/run-migration", async (req, res) => {
-  try {
-    // Add quality score columns
-    await pool.query(`
-      ALTER TABLE conversations 
-      ADD COLUMN IF NOT EXISTS quality_score INTEGER,
-      ADD COLUMN IF NOT EXISTS score_breakdown JSONB,
-      ADD COLUMN IF NOT EXISTS flagged BOOLEAN DEFAULT false,
-      ADD COLUMN IF NOT EXISTS flag_reasons JSONB DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS reviewed BOOLEAN DEFAULT false;
-    `);
-
-    // Create indexes
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_conversations_flagged 
-      ON conversations(flagged) 
-      WHERE flagged = true;
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_conversations_quality_score 
-      ON conversations(quality_score) 
-      WHERE quality_score IS NOT NULL;
-    `);
-
-    console.log("Migration complete: quality scoring columns added");
-    return res.json({
-      ok: true,
-      message: "Migration complete! Quality scoring columns added.",
-    });
-  } catch (err) {
-    console.error("Migration error:", err);
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// =============================================================================
 // AI QUALITY MONITORING
 // =============================================================================
 
