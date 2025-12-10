@@ -15,6 +15,12 @@ const {
   listLicenseKeys,
   getUsageStats,
 } = require("../services/license");
+const {
+  getQualityStats,
+  getFlaggedConversations,
+  getConversationForReview,
+  markAsReviewed,
+} = require("../services/conversation-scorer");
 
 // Admin authentication middleware
 const ADMIN_SECRET =
@@ -284,6 +290,215 @@ router.get("/plans", async (req, res) => {
   } catch (err) {
     console.error("Error getting plans:", err);
     return res.status(500).json({ ok: false, error: "Failed to get plans" });
+  }
+});
+
+// =============================================================================
+// DATABASE MIGRATIONS
+// =============================================================================
+
+/**
+ * Run database migration for quality scoring
+ * POST /admin/run-migration
+ */
+router.post("/run-migration", async (req, res) => {
+  try {
+    // Add quality score columns
+    await pool.query(`
+      ALTER TABLE conversations 
+      ADD COLUMN IF NOT EXISTS quality_score INTEGER,
+      ADD COLUMN IF NOT EXISTS score_breakdown JSONB,
+      ADD COLUMN IF NOT EXISTS flagged BOOLEAN DEFAULT false,
+      ADD COLUMN IF NOT EXISTS flag_reasons JSONB DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS reviewed BOOLEAN DEFAULT false;
+    `);
+
+    // Create indexes
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_conversations_flagged 
+      ON conversations(flagged) 
+      WHERE flagged = true;
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_conversations_quality_score 
+      ON conversations(quality_score) 
+      WHERE quality_score IS NOT NULL;
+    `);
+
+    console.log("Migration complete: quality scoring columns added");
+    return res.json({
+      ok: true,
+      message: "Migration complete! Quality scoring columns added.",
+    });
+  } catch (err) {
+    console.error("Migration error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// =============================================================================
+// AI QUALITY MONITORING
+// =============================================================================
+
+/**
+ * Get AI quality statistics
+ * GET /admin/quality/stats?period=week
+ */
+router.get("/quality/stats", async (req, res) => {
+  const period = req.query.period || "week";
+  const storeId = req.query.store_id || null;
+
+  const result = await getQualityStats(period, storeId);
+
+  if (result.success) {
+    return res.json({ ok: true, ...result });
+  } else {
+    return res.status(500).json({ ok: false, error: result.error });
+  }
+});
+
+/**
+ * Get flagged conversations for review
+ * GET /admin/quality/flagged?limit=20&include_reviewed=false
+ */
+router.get("/quality/flagged", async (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  const includeReviewed = req.query.include_reviewed === "true";
+
+  const result = await getFlaggedConversations(limit, includeReviewed);
+
+  if (result.success) {
+    return res.json({ ok: true, conversations: result.conversations });
+  } else {
+    return res.status(500).json({ ok: false, error: result.error });
+  }
+});
+
+/**
+ * Get a single conversation for review
+ * GET /admin/quality/conversation/:id
+ */
+router.get("/quality/conversation/:id", async (req, res) => {
+  const conversationId = parseInt(req.params.id);
+
+  if (!conversationId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Invalid conversation ID" });
+  }
+
+  const result = await getConversationForReview(conversationId);
+
+  if (result.success) {
+    return res.json({ ok: true, ...result });
+  } else {
+    return res.status(404).json({ ok: false, error: result.error });
+  }
+});
+
+/**
+ * Mark a conversation as reviewed
+ * POST /admin/quality/conversation/:id/reviewed
+ */
+router.post("/quality/conversation/:id/reviewed", async (req, res) => {
+  const conversationId = parseInt(req.params.id);
+
+  if (!conversationId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Invalid conversation ID" });
+  }
+
+  const result = await markAsReviewed(conversationId);
+
+  if (result.success) {
+    return res.json({ ok: true, message: "Marked as reviewed" });
+  } else {
+    return res.status(500).json({ ok: false, error: result.error });
+  }
+});
+
+/**
+ * Export conversations for analysis
+ * GET /admin/quality/export?from=2024-01-01&to=2024-12-31&min_messages=2
+ */
+router.get("/quality/export", async (req, res) => {
+  const { from, to, min_messages = 2 } = req.query;
+
+  try {
+    let dateFilter = "";
+    const params = [];
+    let paramIndex = 1;
+
+    if (from) {
+      dateFilter += ` AND c.started_at >= $${paramIndex}`;
+      params.push(from);
+      paramIndex++;
+    }
+    if (to) {
+      dateFilter += ` AND c.started_at <= $${paramIndex}`;
+      params.push(to);
+      paramIndex++;
+    }
+
+    // Get conversations
+    const conversationsResult = await pool.query(
+      `
+      SELECT 
+        c.id,
+        c.session_id,
+        c.started_at,
+        c.ended_at,
+        c.message_count,
+        c.quality_score,
+        c.score_breakdown,
+        c.flagged,
+        c.flag_reasons,
+        c.language,
+        c.device_type,
+        s.store_name,
+        s.store_id as store_identifier
+      FROM conversations c
+      JOIN stores s ON c.store_id = s.id
+      WHERE c.message_count >= $${paramIndex}
+      ${dateFilter}
+      ORDER BY c.started_at DESC
+    `,
+      [...params, parseInt(min_messages)]
+    );
+
+    // Get messages for each conversation
+    const conversations = [];
+    for (const conv of conversationsResult.rows) {
+      const messagesResult = await pool.query(
+        `
+        SELECT role, content, products_shown, created_at
+        FROM conversation_messages
+        WHERE conversation_id = $1
+        ORDER BY created_at ASC
+      `,
+        [conv.id]
+      );
+
+      conversations.push({
+        ...conv,
+        messages: messagesResult.rows,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      export_date: new Date().toISOString(),
+      filters: { from, to, min_messages },
+      total_conversations: conversations.length,
+      conversations,
+    });
+  } catch (err) {
+    console.error("Error exporting conversations:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to export conversations" });
   }
 });
 
