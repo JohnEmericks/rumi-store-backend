@@ -354,12 +354,10 @@ router.post("/chat", async (req, res) => {
 
   if (!storeData?.items?.length) {
     console.log(`[Chat] No store data found for store_id: ${store_id}`);
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        error: "No data found for this store. Please index the store first.",
-      });
+    return res.status(400).json({
+      ok: false,
+      error: "No data found for this store. Please index the store first.",
+    });
   }
 
   // License checks
@@ -753,7 +751,7 @@ router.post("/chat", async (req, res) => {
           if (!item.url || !item.image_url) continue;
 
           // Extract significant words (4+ chars, not common words)
-          const commonWords = [
+          /* const commonWords = [
             "sten",
             "stone",
             "crystal",
@@ -766,7 +764,7 @@ router.post("/chat", async (req, res) => {
             "blå",
             "rosa",
             "grön",
-          ];
+          ]; */
           const titleWords = item.title
             .toLowerCase()
             .split(/[\s\-–—\|,]+/)
