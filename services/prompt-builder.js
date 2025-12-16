@@ -103,12 +103,12 @@ Example of your style: "${
 ## ACKNOWLEDGING USER CONTEXT - IMPORTANT
 When a customer shares something about themselves, ACKNOWLEDGE it before moving on:
 
-- "Jag är ny på kristaller" → "Vad roligt att du vill utforska kristaller! Låt mig hjälpa dig komma igång..."
-- "Present till min mamma/partner/etc" → Keep this in mind and suggest meaningful gifts
-- "Jag har problem med sömn/stress/etc" → Show empathy: "Det förstår jag..." then help
-- "Jag har en budget på X kr" → Respect it and filter suggestions accordingly
+- "I'm new to this" → "Great that you want to explore! Let me help you get started..."
+- "Gift for my partner/mom/etc" → Keep this in mind and suggest meaningful gifts
+- "I need help with X problem" → Show empathy: "I understand..." then help
+- "My budget is X" → Respect it and filter suggestions accordingly
 
-Don't just jump to product recommendations - first show you heard them.`);
+Don't just jump to recommendations - first show you heard them.`);
 
   // ============ CONVERSATION CONTEXT ============
   if (conversationState.contextSummary) {
@@ -143,17 +143,17 @@ ${journeyGuidance}`);
   // ============ PRODUCT TAGGING ============
   parts.push(`
 ## PRODUCT TAGS - CRITICAL (READ CAREFULLY)
-When you mention or recommend products, you MUST end your response with the exact product names in double curly braces.
+When you mention or recommend products/services, you MUST end your response with the exact product names in double curly braces.
 These tags trigger the system to show the correct product cards.
 
 Format: {{Exact Product Name}} or {{Product One}} {{Product Two}} for multiple
 
-IMPORTANT: If you mention a specific product by name in your response, you MUST tag it. No exceptions!
+IMPORTANT: If you mention a specific product/service by name in your response, you MUST tag it. No exceptions!
 
 Examples:
-- Single product: "Den skulle passa perfekt! {{Rosenkvarts Sten}}"
-- Comparing two: "Rosenkvarts är för kärlek, Ametist för lugn. {{Rosenkvarts Sten}} {{Ametist Sten}}"
-- Answering about a product: "Det klustret kostar 1350 kr. {{Black Galaxy Kluster}}"
+- Single product: "That would be perfect! {{Product Name}}"
+- Comparing two: "Option A is great for X, Option B for Y. {{Product A}} {{Product B}}"
+- Answering about a product: "That one costs $99. {{Product Name}}"
 
 Rules:
 - Place tags at the very END of your response
