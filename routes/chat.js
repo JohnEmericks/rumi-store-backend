@@ -751,7 +751,7 @@ router.post("/chat", async (req, res) => {
           if (!item.url || !item.image_url) continue;
 
           // Extract significant words (4+ chars, not common words)
-          /* const commonWords = [
+          const commonWords = [
             "sten",
             "stone",
             "crystal",
@@ -764,7 +764,7 @@ router.post("/chat", async (req, res) => {
             "blå",
             "rosa",
             "grön",
-          ]; */
+          ];
           const titleWords = item.title
             .toLowerCase()
             .split(/[\s\-–—\|,]+/)
