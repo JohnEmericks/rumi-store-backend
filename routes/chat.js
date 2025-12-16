@@ -1,11 +1,13 @@
 /**
- * Chat Routes (Refactored)
+ * Chat Routes (Refactored with Stage-Aware RAG)
  *
  * Smart conversational AI with:
  * - Intent classification
  * - Conversation state tracking
+ * - Stage-aware RAG (doesn't retrieve products in discovery phase)
  * - Dynamic prompt building
  * - Context-aware responses
+ * - Dynamic token limits based on journey stage
  */
 
 const express = require("express");
@@ -128,6 +130,112 @@ function determineLanguage(language, personality) {
   if (personality?.language === "sv") return "Swedish";
   if (personality?.language === "en") return "English";
   return "Swedish"; // Default
+}
+
+/**
+ * NEW: Determine if we should retrieve products based on intent and journey stage
+ *
+ * Key principle: Don't overwhelm users with products during discovery phase.
+ * Only retrieve products when:
+ * 1. User asks for something specific
+ * 2. We've already established what they need
+ * 3. They're in a later journey stage
+ */
+function shouldRetrieveProducts(currentIntent, conversationState) {
+  const { primary } = currentIntent;
+  const { journeyStage, turnCount } = conversationState;
+
+  // NEVER retrieve products for these intents (they're just exploring)
+  const explorationIntents = [
+    INTENTS.GREETING,
+    INTENTS.BROWSE, // "What do you have?"
+    INTENTS.UNCLEAR, // "Not sure what I'm looking for"
+  ];
+
+  // ALWAYS retrieve for these (they know what they want or are asking about specific products)
+  const productIntents = [
+    INTENTS.SEARCH, // "Do you have X?"
+    INTENTS.PRODUCT_INFO, // "Tell me about this"
+    INTENTS.PRICE_CHECK, // "How much is X?"
+    INTENTS.AVAILABILITY, // "Is X in stock?"
+    INTENTS.COMPARE, // "Compare X and Y"
+  ];
+
+  // Terminal intents - no products needed
+  const terminalIntents = [INTENTS.THANKS, INTENTS.GOODBYE];
+
+  // 1. Never retrieve for terminal intents
+  if (terminalIntents.includes(primary)) {
+    return false;
+  }
+
+  // 2. Never retrieve for exploration intents
+  if (explorationIntents.includes(primary)) {
+    console.log(`[RAG] Skipping - exploration intent: ${primary}`);
+    return false;
+  }
+
+  // 3. Always retrieve for direct product questions
+  if (productIntents.includes(primary)) {
+    console.log(`[RAG] Retrieving - product intent: ${primary}`);
+    return true;
+  }
+
+  // 4. For RECOMMENDATION intent: only retrieve if we have context
+  if (primary === INTENTS.RECOMMENDATION) {
+    // If we're still in early exploration (< 2 turns), ask questions first
+    if (journeyStage === JOURNEY_STAGES.EXPLORING && turnCount < 2) {
+      console.log(
+        `[RAG] Skipping - RECOMMENDATION too early (turn ${turnCount})`
+      );
+      return false;
+    }
+    // Otherwise, retrieve
+    console.log(
+      `[RAG] Retrieving - RECOMMENDATION with context (turn ${turnCount})`
+    );
+    return true;
+  }
+
+  // 5. For AFFIRMATIVE/NEGATIVE: only retrieve if discussing products
+  if (primary === INTENTS.AFFIRMATIVE || primary === INTENTS.NEGATIVE) {
+    const hasProductContext = conversationState.lastProducts.length > 0;
+    if (!hasProductContext) {
+      console.log(`[RAG] Skipping - ${primary} without product context`);
+    }
+    return hasProductContext;
+  }
+
+  // 6. For CONTACT/SHIPPING/RETURNS: retrieve store info pages, not products
+  if ([INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(primary)) {
+    console.log(`[RAG] Retrieving - info intent: ${primary}`);
+    return true; // Will filter to only pages in RAG logic
+  }
+
+  // 7. Default: only retrieve if past exploration stage
+  const shouldRetrieve = journeyStage !== JOURNEY_STAGES.EXPLORING;
+  if (!shouldRetrieve) {
+    console.log(`[RAG] Skipping - still in EXPLORING stage`);
+  }
+  return shouldRetrieve;
+}
+
+/**
+ * NEW: Get max tokens based on journey stage
+ * Discovery phase needs short responses, later stages can be longer
+ */
+function getMaxTokensForStage(journeyStage) {
+  const tokenLimits = {
+    [JOURNEY_STAGES.EXPLORING]: 150, // ~40 words - KEEP IT SHORT
+    [JOURNEY_STAGES.INTERESTED]: 200, // ~50 words - still concise
+    [JOURNEY_STAGES.COMPARING]: 300, // ~75 words - comparisons need space
+    [JOURNEY_STAGES.DECIDING]: 250, // ~60 words - clear recommendation
+    [JOURNEY_STAGES.READY_TO_BUY]: 150, // ~40 words - just confirm
+    [JOURNEY_STAGES.SEEKING_HELP]: 300, // ~75 words - helpful info
+    [JOURNEY_STAGES.CLOSING]: 100, // ~25 words - goodbye
+  };
+
+  return tokenLimits[journeyStage] || 200;
 }
 
 /**
@@ -412,7 +520,7 @@ router.post("/chat", async (req, res) => {
   const followUpContext = getFollowUpContext(conversationState, currentIntent);
 
   console.log(
-    `[Chat] Intent: ${currentIntent.primary} (${currentIntent.confidence}), Stage: ${conversationState.journeyStage}`
+    `[Chat] Intent: ${currentIntent.primary} (confidence: ${currentIntent.confidence}), Stage: ${conversationState.journeyStage}, Turn: ${conversationState.turnCount}`
   );
   if (followUpContext.hasContext) {
     console.log(`[Chat] Follow-up context:`, followUpContext.explanation);
@@ -483,128 +591,82 @@ router.post("/chat", async (req, res) => {
   }
 
   try {
-    // ============ RAG SEARCH ============
-    const [queryVector] = await embedTexts([message]);
+    // ============ STAGE-AWARE RAG: Only retrieve if appropriate ============
+    const shouldFetchProducts = shouldRetrieveProducts(
+      currentIntent,
+      conversationState
+    );
 
-    // Score all items
-    const scored = storeData.items
-      .filter((item) => item.type !== "product" || item.in_stock !== false)
-      .map((item) => ({
-        item,
-        score: cosineSimilarity(queryVector, item.embedding),
-      }))
-      .sort((a, b) => b.score - a.score);
+    let relevantProducts = [];
+    let relevantPages = [];
+    let bestProductScore = 0;
 
-    const scoredProducts = scored.filter((s) => s.item.type === "product");
-    const scoredPages = scored.filter((s) => s.item.type === "page");
-
-    // Dynamic thresholds based on intent
-    let productThreshold = 0.38;
-    let pageThreshold = 0.45;
-
-    if (
-      currentIntent.primary === INTENTS.BROWSE ||
-      currentIntent.primary === INTENTS.RECOMMENDATION
-    ) {
-      productThreshold = 0.32; // More lenient for browsing
-    }
-    if (
-      currentIntent.primary === INTENTS.PRODUCT_INFO &&
-      conversationState.lastProducts.length > 0
-    ) {
-      productThreshold = 0.3; // Very lenient if following up on a product
-    }
-
-    let relevantProducts = scoredProducts
-      .filter((s) => s.score >= productThreshold)
-      .slice(0, 5);
-    let relevantPages = scoredPages
-      .filter((s) => s.score >= pageThreshold)
-      .slice(0, 2);
-
-    // ============ "MORE" REQUEST HANDLING ============
-    // If user asks for "more" of something, include more products from the same category
-    const isMoreRequest =
-      /\b(fler|mer|more|annat|andra|other|alternatives)\b/i.test(message);
-
-    if (isMoreRequest && conversationState.lastProducts.length > 0) {
-      // Extract key words from last products to find related items
-      const lastProductNames = conversationState.lastProducts.map((p) =>
-        p.toLowerCase()
+    if (shouldFetchProducts) {
+      console.log(
+        `[RAG] Retrieving products/pages for query: "${message.substring(
+          0,
+          50
+        )}..."`
       );
-      const keyWords = [];
 
-      for (const name of lastProductNames) {
-        // Extract significant words (likely product type/category)
-        const words = name.split(/[\s\-–—\|,]+/).filter((w) => w.length >= 4);
-        keyWords.push(...words);
-      }
+      const [queryVector] = await embedTexts([message]);
 
-      // Find more products matching these keywords
-      for (const item of storeData.items) {
-        if (item.type !== "product") continue;
-        if (!item.url || !item.image_url) continue;
+      // Score all items
+      const scored = storeData.items
+        .filter((item) => item.type !== "product" || item.in_stock !== false)
+        .map((item) => ({
+          item,
+          score: cosineSimilarity(queryVector, item.embedding),
+        }))
+        .sort((a, b) => b.score - a.score);
 
-        const titleLower = item.title.toLowerCase();
-        const alreadyIncluded = relevantProducts.some(
-          (p) => p.item.title.toLowerCase() === titleLower
-        );
+      const scoredProducts = scored.filter((s) => s.item.type === "product");
+      const scoredPages = scored.filter((s) => s.item.type === "page");
 
-        if (!alreadyIncluded) {
-          // Check if this product matches any key words
-          const matches = keyWords.some((kw) => titleLower.includes(kw));
-          if (matches) {
-            relevantProducts.push({
-              item,
-              score: 0.7,
-              boosted: true,
-              reason: "category_match",
-            });
+      // Context-aware boosting (boost products from ongoing conversation)
+      if (conversationState.lastProducts.length > 0) {
+        scoredProducts.forEach((s) => {
+          if (conversationState.lastProducts.includes(s.item.title)) {
+            s.score *= 1.3;
+            s.boosted = true;
           }
-        }
+        });
+        scoredProducts.sort((a, b) => b.score - a.score);
       }
 
-      // Limit to 8 products for "more" requests
-      relevantProducts = relevantProducts.slice(0, 8);
+      // For info intents (CONTACT, SHIPPING, RETURNS), prioritize pages
+      if (
+        [INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(
+          currentIntent.primary
+        )
+      ) {
+        relevantPages = scoredPages.slice(0, 3).filter((s) => s.score >= 0.3);
+        relevantProducts = []; // Don't show products for info queries
+        console.log(
+          `[RAG] Info intent - retrieved ${relevantPages.length} pages, 0 products`
+        );
+      } else {
+        // Normal product retrieval
+        relevantProducts = scoredProducts
+          .slice(0, 8)
+          .filter((s) => s.score >= 0.35);
+        relevantPages = scoredPages.slice(0, 2).filter((s) => s.score >= 0.3);
+        bestProductScore = scoredProducts[0]?.score || 0;
+        console.log(
+          `[RAG] Retrieved ${relevantProducts.length} products, ${
+            relevantPages.length
+          } pages (best score: ${bestProductScore.toFixed(3)})`
+        );
+      }
+    } else {
+      console.log(
+        `[RAG] Skipped retrieval - discovery phase or inappropriate intent`
+      );
     }
 
-    // ============ CONTEXT-AWARE PRODUCT BOOSTING ============
-    // If user is following up on a product, ensure it's in the context
-    if (
-      conversationState.lastProducts.length > 0 &&
-      [
-        INTENTS.AFFIRMATIVE,
-        INTENTS.PRODUCT_INFO,
-        INTENTS.PRICE_CHECK,
-        INTENTS.PURCHASE,
-      ].includes(currentIntent.primary)
-    ) {
-      for (const productName of conversationState.lastProducts) {
-        const alreadyIncluded = relevantProducts.some(
-          (p) => p.item.title.toLowerCase() === productName.toLowerCase()
-        );
-
-        if (!alreadyIncluded) {
-          const productData = storeData.items.find(
-            (item) =>
-              item.type === "product" &&
-              item.title.toLowerCase() === productName.toLowerCase()
-          );
-
-          if (productData) {
-            relevantProducts.unshift({
-              item: productData,
-              score: 1.0,
-              boosted: true,
-            });
-          }
-        }
-      }
-    }
-
-    // ============ BUILD PROMPT ============
+    // ============ BUILD CONTEXT & SYSTEM PROMPT ============
     const systemPrompt = buildSystemPrompt({
-      storeName: storeData.storeName,
+      storeName: storeData.storeName || "this store",
       personality: storeData.personality,
       language: userLanguage,
       conversationState,
@@ -615,50 +677,61 @@ router.post("/chat", async (req, res) => {
 
     const messages = [{ role: "system", content: systemPrompt }];
 
-    // Add conversation history with product context
-    if (history.length > 0) {
-      history.slice(-8).forEach((h) => {
-        if (h.role === "assistant" && h.products_shown?.length > 0) {
-          messages.push({
-            role: h.role,
-            content: `${h.content}\n[Products shown: ${h.products_shown.join(
-              ", "
-            )}]`,
-          });
-        } else {
-          messages.push({ role: h.role, content: h.content });
-        }
-      });
-    }
+    // Add conversation history
+    const historyRows = await pool.query(
+      "SELECT role, content, products_shown FROM conv_messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      [conversation?.id]
+    );
 
-    // Add current message
-    messages.push({ role: "user", content: message });
+    const conversationHistory = historyRows.rows.map((row) => ({
+      role: row.role,
+      content: row.content,
+      products_shown: row.products_shown,
+    }));
 
-    // Add RAG context
-    const bestProductScore = relevantProducts[0]?.score || 0;
-    const confidenceNote =
-      bestProductScore < 0.45 &&
-      [INTENTS.SEARCH, INTENTS.PRODUCT_INFO].includes(currentIntent.primary)
-        ? "\n\n⚠️ Note: These results aren't a strong match. Be honest if nothing fits well."
-        : "";
-
-    const contextMessage = buildContextMessage({
-      products: relevantProducts,
-      pages: relevantPages,
-      facts: storeFacts,
-      conversationState,
-      currentIntent,
-      confidenceNote,
+    conversationHistory.forEach((turn) => {
+      messages.push({ role: turn.role, content: turn.content });
     });
 
-    messages.push({ role: "user", content: contextMessage });
+    // Add current user message
+    messages.push({ role: "user", content: message });
 
-    // ============ CALL AI ============
+    // Add context ONLY if we have products/pages
+    if (
+      relevantProducts.length > 0 ||
+      relevantPages.length > 0 ||
+      [INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(
+        currentIntent.primary
+      )
+    ) {
+      const confidenceNote =
+        bestProductScore < 0.5 && relevantProducts.length > 0
+          ? "\n\n⚠️ Note: These results aren't a strong match. Be honest if nothing fits well."
+          : "";
+
+      const contextMessage = buildContextMessage({
+        products: relevantProducts,
+        pages: relevantPages,
+        facts: storeFacts,
+        conversationState,
+        currentIntent,
+        confidenceNote,
+      });
+
+      messages.push({ role: "user", content: contextMessage });
+    }
+
+    // ============ CALL AI WITH DYNAMIC TOKEN LIMIT ============
+    const maxTokens = getMaxTokensForStage(conversationState.journeyStage);
+    console.log(
+      `[AI] Calling with max_tokens: ${maxTokens} (stage: ${conversationState.journeyStage})`
+    );
+
     const completion = await openai.chat.completions.create({
       model: "gpt-4o",
       messages,
-      temperature: 0.6, // Slightly higher for more natural responses
-      max_tokens: 300,
+      temperature: 0.6,
+      max_tokens: maxTokens,
     });
 
     const rawAnswer =
@@ -721,7 +794,7 @@ router.post("/chat", async (req, res) => {
     }
 
     // Fallback 2: If still no cards but AI mentioned products, try to find them in the response
-    if (productCards.length === 0) {
+    if (productCards.length === 0 && relevantProducts.length > 0) {
       const answerLower = answer.toLowerCase();
 
       // Look for products mentioned in the answer
@@ -812,11 +885,13 @@ router.post("/chat", async (req, res) => {
         follow_up: followUpContext.hasContext
           ? followUpContext.explanation
           : null,
+        rag_triggered: shouldFetchProducts,
         products_found: relevantProducts.length,
         pages_found: relevantPages.length,
         product_tags: taggedProductNames.length > 0 ? taggedProductNames : null,
         products_matched: productCards.length,
         best_score: bestProductScore.toFixed(3),
+        max_tokens: maxTokens,
         top_products: relevantProducts.slice(0, 3).map((e) => ({
           title: e.item.title,
           score: e.score.toFixed(3),
