@@ -16,21 +16,33 @@ async function getOrCreateConversation(
   deviceType
 ) {
   try {
-    // Try to find existing active conversation
+    // Try to find existing conversation (any status)
     const existing = await pool.query(
-      `SELECT id, message_count FROM conversations 
-       WHERE store_id = $1 AND session_id = $2 AND status = 'active'`,
+      `SELECT id, message_count, status FROM conversations 
+       WHERE store_id = $1 AND session_id = $2`,
       [storeDbId, sessionId]
     );
 
     if (existing.rowCount > 0) {
-      return existing.rows[0];
+      const conv = existing.rows[0];
+
+      // If conversation was ended, reactivate it
+      if (conv.status !== "active") {
+        await pool.query(
+          `UPDATE conversations SET status = 'active' WHERE id = $1`,
+          [conv.id]
+        );
+      }
+
+      return { id: conv.id, message_count: conv.message_count };
     }
 
-    // Create new conversation
+    // Create new conversation with ON CONFLICT to handle race conditions
     const result = await pool.query(
       `INSERT INTO conversations (store_id, session_id, language, device_type, status)
        VALUES ($1, $2, $3, $4, 'active')
+       ON CONFLICT (store_id, session_id) 
+       DO UPDATE SET status = 'active'
        RETURNING id, message_count`,
       [storeDbId, sessionId, language || null, deviceType || null]
     );
