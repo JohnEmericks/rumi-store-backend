@@ -458,4 +458,94 @@ router.get("/quality/export", async (req, res) => {
   }
 });
 
+// =============================================================================
+// DEBUG ENDPOINTS
+// =============================================================================
+
+/**
+ * Get all stores with item counts
+ * GET /admin/debug/stores
+ */
+router.get("/debug/stores", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        s.id,
+        s.store_id,
+        s.site_url,
+        s.store_name,
+        s.created_at,
+        COUNT(si.id) as item_count
+      FROM stores s
+      LEFT JOIN store_items si ON s.id = si.store_id
+      GROUP BY s.id, s.store_id, s.site_url, s.store_name, s.created_at
+      ORDER BY s.created_at DESC
+    `);
+
+    return res.json({
+      ok: true,
+      stores: result.rows,
+    });
+  } catch (err) {
+    console.error("Error fetching stores:", err);
+    return res.status(500).json({ ok: false, error: "Failed to fetch stores" });
+  }
+});
+
+/**
+ * Get sample items for a store
+ * GET /admin/debug/items?store_id=xxx
+ */
+router.get("/debug/items", async (req, res) => {
+  const { store_id } = req.query;
+
+  if (!store_id) {
+    return res.status(400).json({ ok: false, error: "store_id is required" });
+  }
+
+  try {
+    // First get the internal store ID
+    const storeResult = await pool.query(
+      "SELECT id FROM stores WHERE store_id = $1",
+      [store_id]
+    );
+
+    if (storeResult.rowCount === 0) {
+      return res.json({ ok: true, items: [], message: "Store not found" });
+    }
+
+    const storeDbId = storeResult.rows[0].id;
+
+    // Get sample items
+    const itemsResult = await pool.query(
+      `
+      SELECT 
+        id,
+        external_id,
+        type,
+        title,
+        url,
+        SUBSTRING(content, 1, 200) as content,
+        price,
+        stock_status,
+        in_stock
+      FROM store_items
+      WHERE store_id = $1
+      ORDER BY type, id
+      LIMIT 20
+    `,
+      [storeDbId]
+    );
+
+    return res.json({
+      ok: true,
+      store_db_id: storeDbId,
+      items: itemsResult.rows,
+    });
+  } catch (err) {
+    console.error("Error fetching items:", err);
+    return res.status(500).json({ ok: false, error: "Failed to fetch items" });
+  }
+});
+
 module.exports = router;
