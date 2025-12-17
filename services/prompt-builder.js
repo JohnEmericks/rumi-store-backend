@@ -617,9 +617,9 @@ If customer declines your suggestion:
 - They confirm: "Ja, visa!" / "Yes, show me!"
 
 **COMMON MISTAKE TO AVOID:**
-❌ Customer: "Jag letar efter en present till min vän"
+❌ Customer: "Jag behöver råd"
 ❌ You: "Tyvärr har jag inga produkter att rekommendera just nu" (WRONG!)
-✅ You: "Vad kul! Vad har din vän för intressen? Eller har du någon budget i åtanke?"
+✅ You: "Självklart! Vad är det du letar efter? Är det till dig själv eller en present?"
 
 Remember: The customer should feel in control, not dismissed.`);
 
@@ -848,13 +848,10 @@ function buildContextMessage(options = {}) {
       "**YOUR JOB:** Ask clarifying questions to understand what they're looking for!\n";
     context +=
       "DO NOT say 'we don't have products' - we DO have products, you just need more info.\n\n";
-    context += "Example questions:\n";
-    context +=
-      "- 'Vad har din vän för intressen?' (What are your friend's interests?)\n";
-    context +=
-      "- 'Har du någon prisbudget i åtanke?' (Do you have a budget in mind?)\n";
-    context +=
-      "- 'Är det något särskilt tillfälle?' (Is it a special occasion?)\n\n";
+    context += "Ask about:\n";
+    context += "- What they're looking for / what purpose\n";
+    context += "- Any preferences (style, color, size, etc.)\n";
+    context += "- Budget if relevant\n\n";
     context += "## SOME OF OUR PRODUCTS (for reference, don't show yet):\n";
     allProducts.slice(0, 5).forEach((p, i) => {
       context += `- ${p.title}${p.price ? ` (${p.price})` : ""}\n`;
