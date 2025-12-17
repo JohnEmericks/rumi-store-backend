@@ -106,6 +106,26 @@ async function initDb() {
       );
     `);
 
+    // Add quality scoring columns to conversations (for conversation-scorer service)
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS quality_score INTEGER;`
+    );
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS quality_flags JSONB DEFAULT '[]';`
+    );
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS quality_summary TEXT;`
+    );
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ;`
+    );
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;`
+    );
+    await pool.query(
+      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS reviewer_notes TEXT;`
+    );
+
     // Conversation messages (Phase 2)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS conv_messages (

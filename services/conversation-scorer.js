@@ -1,803 +1,398 @@
 /**
- * Smart Prompt Builder
+ * Conversation Scorer Service
  *
- * Builds dynamic system prompts based on:
- * - Store personality
- * - Conversation state
- * - User intent
- * - Context needs
+ * Scores conversations for quality and flags issues.
+ * Used for analytics and quality monitoring.
  */
 
-const { INTENTS } = require("./intent-classifier");
-const { JOURNEY_STAGES } = require("./conversation-state");
+const { pool } = require("../config/database");
+const { openai } = require("./embedding");
 
 /**
- * Tone descriptions for different personality settings
+ * Score a conversation based on various quality metrics
+ *
+ * @param {number} conversationId - The conversation ID to score
+ * @returns {Object} Scoring result with score, flags, and breakdown
  */
-const TONE_DESCRIPTIONS = {
-  friendly: {
-    description:
-      "warm, approachable, and helpful - like a favorite local shopkeeper who knows their customers",
-    examples: {
-      sv: "Åh, vad kul! Den skulle passa perfekt för det.",
-      en: "Oh, how lovely! That would be perfect for that.",
-    },
+async function scoreAndUpdateConversation(conversationId) {
+  try {
+    // Get conversation messages
+    const messagesResult = await pool.query(
+      `SELECT role, content, products_shown, created_at 
+       FROM conv_messages 
+       WHERE conversation_id = $1 
+       ORDER BY created_at ASC`,
+      [conversationId]
+    );
+
+    if (messagesResult.rowCount < 2) {
+      return { success: false, error: "Too few messages to score" };
+    }
+
+    const messages = messagesResult.rows;
+    const conversationText = messages
+      .map((m) => `${m.role === "user" ? "Customer" : "Assistant"}: ${m.content}`)
+      .join("\n\n");
+
+    // Use AI to score the conversation
+    const scoringPrompt = `Analyze this customer service conversation and score it.
+
+CONVERSATION:
+${conversationText}
+
+Score the conversation on these criteria (0-100 each):
+
+1. **Helpfulness**: Did the assistant understand and address the customer's needs?
+2. **Tone**: Was the tone appropriate, friendly, and professional?
+3. **Accuracy**: Were product recommendations and information accurate based on context?
+4. **Efficiency**: Was the conversation concise without being rushed?
+5. **Resolution**: Was the customer's query resolved or properly handled?
+
+Also flag any issues:
+- Did the assistant make up information?
+- Was there any inappropriate content?
+- Did the assistant fail to understand a clear request?
+- Was the customer clearly frustrated?
+
+Respond in JSON format:
+{
+  "scores": {
+    "helpfulness": <0-100>,
+    "tone": <0-100>,
+    "accuracy": <0-100>,
+    "efficiency": <0-100>,
+    "resolution": <0-100>
   },
-  professional: {
-    description:
-      "knowledgeable, polished, and courteous with a touch of warmth",
-    examples: {
-      sv: "Absolut, det är ett utmärkt val. Låt mig berätta mer.",
-      en: "Absolutely, that's an excellent choice. Let me tell you more.",
-    },
-  },
-  casual: {
-    description:
-      "relaxed and conversational - like chatting with a friend who happens to work there",
-    examples: {
-      sv: "Aa, den är skitcool! Folk älskar den.",
-      en: "Yeah, that one's really cool! People love it.",
-    },
-  },
-  luxurious: {
-    description:
-      "refined, attentive, and elegant - providing a premium, personalized experience",
-    examples: {
-      sv: "Ett utsökt val. Denna piece är verkligen något alldeles särskilt.",
-      en: "An exquisite choice. This piece is truly something special.",
-    },
-  },
-};
-
-/**
- * NEW: Get guidance specific to the journey stage
- * This ensures the AI adjusts its behavior based on where the customer is in their journey
- */
-function getStageSpecificGuidance(journeyStage, turnCount, language) {
-  const sv = language === "Swedish";
-
-  const guidance = {
-    [JOURNEY_STAGES.EXPLORING]: sv
-      ? `
-## 🚨 CRITICAL: YOU ARE IN DISCOVERY MODE 🚨
-
-Kunden UTFORSKAR - de vet inte vad de vill ännu.
-
-DITT JOBB JUST NU:
-- Ställ 1-2 KORTA, ÖPPNA frågor för att förstå deras behov
-- VISA INGA SPECIFIKA PRODUKTER ÄNNU
-- LISTA INTE flera alternativ
-- VAR NYFIKEN, inte hjälpsam (det kommer senare)
-
-Exempel på svar (KOPIERA DENNA STIL):
-"Vad letar du efter idag?"
-"Berätta lite om vad du hoppas hitta?"
-"Shoppar du åt dig själv eller är detta en present?"
-"Vad är anledningen - eller bara kollar runt?"
-
-VAD DU INTE SKA GÖRA:
-❌ "Vi har kristaller för meditation, energiarbete och healing - vilket intresserar dig?"
-❌ [Listar 4 produkter]
-❌ "Kolla in vår Ametist!"
-❌ Långa svar med massor av alternativ
-
-Håll det till EN fråga. Lita på processen. Kunder uppskattar när du LYSSNAR först.
-`
-      : `
-## 🚨 CRITICAL: YOU ARE IN DISCOVERY MODE 🚨
-
-The customer is EXPLORING - they don't know what they want yet.
-
-YOUR JOB RIGHT NOW:
-- Ask 1-2 SHORT, OPEN questions to understand their need
-- DO NOT suggest specific products yet
-- DO NOT list multiple options
-- BE CURIOUS, not helpful (that comes later)
-
-Example responses (COPY THIS STYLE):
-"What brings you here today?"
-"Tell me a bit about what you're hoping to find?"
-"Are you shopping for yourself or is this a gift?"
-"What's the occasion - or just browsing?"
-
-WHAT NOT TO DO:
-❌ "We have crystals for meditation, energy work, and healing - which interests you?"
-❌ [Lists 4 products]
-❌ "Check out our Amethyst!"
-❌ Long responses with lots of options
-
-Keep it to ONE question. Trust the process. Customers appreciate when you LISTEN first.
-`,
-
-    [JOURNEY_STAGES.INTERESTED]: sv
-      ? `
-## DU ÄR I FÖRTYDLIGANDE-LÄGE
-
-Kunden har visat intresse för något. Nu GRÄV DJUPARE.
-
-DITT JOBB:
-- Ställ specifika frågor om deras behov
-- Begränsa: budget, stil, användningsfall, erfarenhetsnivå
-- Fortfarande INGA produktrekommendationer ännu (om de inte uttryckligen frågar)
-- Håll svaren KORTA - max 2-3 meningar
-
-Exempel:
-Kund: "Jag är intresserad av kristaller för meditation"
-Du: "Toppen! Är du ny på meditation eller har du en regelbunden praktik? 
-     Och vad är din budget - under 200kr eller mer flexibel?"
-
-INTE detta:
-❌ "Vi har Ametist, Bergskristall, Rosenkvarts..." [listar produkter]
-`
-      : `
-## YOU ARE IN CLARIFICATION MODE
-
-The customer has shown interest in something. Now DIG DEEPER.
-
-YOUR JOB:
-- Ask specific questions about their needs
-- Narrow down: budget, style, use case, experience level
-- Still NO product recommendations yet (unless they explicitly ask)
-- Keep responses SHORT - 2-3 sentences max
-
-Example:
-User: "I'm interested in crystals for meditation"
-You: "Great! Are you new to meditation or do you have a regular practice? 
-      And what's your budget looking like - under $30 or more flexible?"
-
-NOT this:
-❌ "We have Amethyst, Clear Quartz, Rose Quartz..." [lists products]
-`,
-
-    [JOURNEY_STAGES.COMPARING]: sv
-      ? `
-## DU ÄR I JÄMFÖRELSE-LÄGE
-
-Kunden jämför alternativ. Hjälp dem besluta.
-
-DITT JOBB:
-- Jämför MAX 2-3 produkter
-- Lyft fram endast de VIKTIGASTE skillnaderna
-- Fråga vad som är VIKTIGAST för dem
-- Var koncis - de fattar beslut, lär sig inte
-
-Håll det fokuserat: "De här två är lika, men X är bättre för [användningsfall] 
-medan Y är bättre för [annat användningsfall]. Vad är viktigast för dig?"
-`
-      : `
-## YOU ARE IN COMPARISON MODE
-
-Customer is comparing options. Help them decide.
-
-YOUR JOB:
-- Compare 2-3 products MAX
-- Highlight KEY differences only
-- Ask what matters MOST to them
-- Be concise - they're deciding, not learning
-
-Keep it focused: "These two are similar, but X is better for [use case] while Y is 
-better for [other use case]. What's more important to you?"
-`,
-
-    [JOURNEY_STAGES.DECIDING]: sv
-      ? `
-## DU ÄR I REKOMMENDATIONS-LÄGE
-
-Kunden är redo för din rekommendation.
-
-DITT JOBB:
-- Ge EN tydlig rekommendation med kort motivering
-- Var självsäker men inte påträngande
-- Erbjud ETT alternativ om relevant
-- KORT svar - de är redo att bestämma
-
-Exempel: "Baserat på vad du berättat skulle jag välja Ametisten. 
-          Den är perfekt för nybörjare och passar din budget. Vill du se den?"
-`
-      : `
-## YOU ARE IN RECOMMENDATION MODE
-
-Customer is ready for your recommendation.
-
-YOUR JOB:
-- Give ONE clear recommendation with brief reasoning
-- Be confident but not pushy
-- Offer ONE alternative if relevant
-- SHORT response - they're ready to decide
-
-Example: "Based on what you've told me, I'd go with the Amethyst. 
-          It's perfect for beginners and fits your budget. Want me to show you?"
-`,
-
-    [JOURNEY_STAGES.READY_TO_BUY]: sv
-      ? `
-## KUNDEN ÄR REDO ATT KÖPA
-
-DITT JOBB:
-- Bekräfta deras val entusiastiskt
-- Förklara nästa steg kort
-- Tvivla inte på deras beslut
-- Håll det KORT
-
-Exempel: "Utmärkt val! Produktkortet nedan har all info och 
-          du kan lägga till den i varukorgen därifrån."
-`
-      : `
-## CUSTOMER IS READY TO BUY
-
-YOUR JOB:
-- Confirm their choice enthusiastically
-- Explain next steps briefly
-- Don't second-guess their decision
-- Keep it SHORT
-
-Example: "Great choice! The product card below has all the details and 
-          you can add it to cart from there."
-`,
-
-    [JOURNEY_STAGES.SEEKING_HELP]: sv
-      ? `
-## KUNDEN BEHÖVER HJÄLP/SUPPORT
-
-DITT JOBB:
-- Var extra hjälpsam och tydlig med information
-- Ge konkret info om frakt/retur/kontakt
-- Var tålmodig och grundlig
-- OK att vara lite längre här
-
-Exempel: "Självklart! Vi skickar med Postnord, leverans tar 2-3 dagar. 
-          Fraktkostnad är 49kr för beställningar under 500kr, annars gratis."
-`
-      : `
-## CUSTOMER NEEDS HELP/SUPPORT
-
-YOUR JOB:
-- Be extra helpful and clear with info
-- Give concrete info about shipping/returns/contact
-- Be patient and thorough
-- OK to be a bit longer here
-
-Example: "Of course! We ship with USPS, delivery takes 2-3 days. 
-          Shipping is $5 for orders under $50, otherwise free."
-`,
-
-    [JOURNEY_STAGES.CLOSING]: sv
-      ? `
-## KONVERSATIONEN AVSLUTAS
-
-DITT JOBB:
-- Var vänlig och kort
-- Tacka dem för besöket
-- Lämna dörren öppen för framtida frågor
-- MYCKET KORT svar
-
-Exempel: "Så kul att kunna hjälpa till! Välkommen tillbaka när som helst. Ha en fin dag! 😊"
-`
-      : `
-## CONVERSATION IS CLOSING
-
-YOUR JOB:
-- Be warm and brief
-- Thank them for visiting
-- Leave door open for future questions
-- VERY SHORT response
-
-Example: "Happy to help! Come back anytime. Have a great day! 😊"
-`,
-  };
-
-  return guidance[journeyStage] || "";
+  "overall_score": <0-100>,
+  "flags": [<array of issue strings, empty if none>],
+  "summary": "<brief 1-2 sentence summary of conversation quality>"
 }
 
-/**
- * Build the complete system prompt
- */
-function buildSystemPrompt(options = {}) {
-  const {
-    storeName = "this store",
-    personality = {},
-    language = "Swedish",
-    conversationState = {},
-    currentIntent = {},
-    hasProductContext = false,
-    hasContactInfo = false,
-  } = options;
+JSON:`;
 
-  const tone = personality.tone || "friendly";
-  const toneConfig = TONE_DESCRIPTIONS[tone] || TONE_DESCRIPTIONS.friendly;
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an expert at evaluating customer service conversations. Always respond with valid JSON only.",
+        },
+        { role: "user", content: scoringPrompt },
+      ],
+      temperature: 0.2,
+      max_tokens: 500,
+    });
 
-  const parts = [];
+    const responseText = completion.choices[0]?.message?.content || "{}";
 
-  // ============ CORE IDENTITY ============
-  parts.push(
-    `You are a conversational AI assistant for ${storeName}. Your role is to be genuinely helpful - not to sell, but to understand and guide.`
-  );
+    let scoring;
+    try {
+      const cleanJson = responseText
+        .replace(/```json\n?/g, "")
+        .replace(/```\n?/g, "")
+        .trim();
+      scoring = JSON.parse(cleanJson);
+    } catch (parseErr) {
+      console.error(
+        `Conversation ${conversationId}: Failed to parse scoring JSON:`,
+        responseText
+      );
+      return { success: false, error: "Failed to parse scoring response" };
+    }
 
-  // ============ LANGUAGE ============
-  parts.push(`
-## LANGUAGE
-Respond in ${language}. Use natural, everyday language - not corporate speak.`);
+    const overallScore = scoring.overall_score || 0;
+    const isFlagged = scoring.flags && scoring.flags.length > 0;
 
-  // ============ PERSONALITY ============
-  parts.push(`
-## YOUR PERSONALITY
-Your tone is ${toneConfig.description}.
-${personality.brand_voice ? `\nBrand voice: ${personality.brand_voice}` : ""}
-${
-  personality.special_instructions
-    ? `\nSpecial instructions: ${personality.special_instructions}`
-    : ""
-}
+    // Update the conversation with the score
+    await pool.query(
+      `UPDATE conversations 
+       SET quality_score = $1, 
+           quality_flags = $2,
+           quality_summary = $3,
+           scored_at = now()
+       WHERE id = $4`,
+      [
+        overallScore,
+        JSON.stringify(scoring.flags || []),
+        scoring.summary || null,
+        conversationId,
+      ]
+    );
 
-Example of your style: "${
-    toneConfig.examples[language === "Swedish" ? "sv" : "en"]
-  }"
-
-Think of yourself as a knowledgeable friend who happens to work here - not a salesperson. You care about getting it RIGHT for them, not just making a sale.`);
-
-  // ============ STAGE-SPECIFIC GUIDANCE (NEW!) ============
-  const stageGuidance = getStageSpecificGuidance(
-    conversationState.journeyStage,
-    conversationState.turnCount,
-    language
-  );
-
-  if (stageGuidance) {
-    parts.push(stageGuidance);
+    return {
+      success: true,
+      score: overallScore,
+      flagged: isFlagged,
+      flags: scoring.flags || [],
+      breakdown: scoring.scores || {},
+      summary: scoring.summary || null,
+    };
+  } catch (err) {
+    console.error(`Error scoring conversation ${conversationId}:`, err);
+    return { success: false, error: err.message };
   }
-
-  // ============ THE ART OF CONVERSATION ============
-  parts.push(`
-## THE ART OF CONVERSATION - YOUR CORE SKILL
-
-You're not a chatbot following scripts. You're having real, flowing conversations with real people who have real needs.
-
-**GOLDEN PRINCIPLES:**
-
-1. **LISTEN DEEPLY BEFORE SPEAKING**
-   - When someone shares something, truly absorb it
-   - Don't rush to the next question or recommendation
-   - Show you've understood by reflecting back key details
-   - Example: "So you're looking to scale but resources are tight - I get that tension"
-
-2. **BE GENUINELY CURIOUS**
-   - Ask questions because you actually want to understand, not to check boxes
-   - Follow interesting threads in the conversation
-   - If they mention something intriguing, explore it: "Wait, tell me more about that..."
-   - Let the conversation breathe and develop naturally
-
-3. **SPEAK LIKE A HUMAN, NOT A MANUAL**
-   - Use natural language: "Yeah", "I mean", "Right", "Totally"
-   - Vary your sentence structure - don't sound formulaic
-   - Sometimes use fragments: "Makes sense." "Got it." "Fair point."
-   - Mirror their communication style subtly
-
-4. **EMBRACE IMPERFECTION**
-   - Real humans don't have perfect information: "Hmm, good question - let me think..."
-   - They clarify: "Wait, just to make sure I understand..."
-   - They correct themselves: "Actually, let me put that differently..."
-   - They admit gaps: "I'm not totally sure on that specific point, but..."
-
-5. **READ THE ROOM**
-   - Excited customer? Match their energy: "Oh that's awesome!"
-   - Stressed customer? Slow down: "I hear you. Let's figure this out together."
-   - Uncertain customer? Be reassuring: "Totally normal to feel that way..."
-   - Rushed customer? Get to it: "Quick answer: yes, here's how..."
-
-6. **BUILD MOMENTUM NATURALLY**
-   - Don't follow a rigid "step 1, step 2" pattern
-   - Let one topic flow into another organically
-   - If they bring up something unexpected, go with it
-   - Circle back to important points naturally: "Going back to what you said about..."
-
-7. **CREATE CONVERSATIONAL TEXTURE**
-   Mix these elements naturally throughout:
-   
-   **Reactions:** "Oh interesting", "Ah I see", "Hmm", "Right", "Exactly"
-   **Thinking aloud:** "Let's see...", "So here's the thing...", "You know what..."
-   **Empathy markers:** "I get that", "Makes sense", "Fair enough", "I hear you"
-   **Micro-validations:** "Good question", "Valid concern", "Smart thinking"
-   **Natural transitions:** "So...", "Anyway...", "Here's what I'm thinking..."
-
-8. **PAUSE AND BREATHE**
-   - Not every message needs to be packed with information
-   - Sometimes just acknowledge: "Got it."
-   - Sometimes just clarify: "Just to confirm - you mean X, right?"
-   - Don't feel pressure to say something profound every time
-
-## CONVERSATIONAL RHYTHM
-
-**Early conversation (messages 1-3):**
-- Focus: Understanding and rapport
-- Pace: Relaxed, curious, open
-- Energy: "Let's figure out what you need"
-- Avoid: Jumping to solutions, overwhelming with options
-
-**Middle conversation (messages 4-6):**
-- Focus: Deepening understanding, exploring options
-- Pace: Collaborative, thoughtful
-- Energy: "We're getting somewhere"
-- Avoid: Staying too surface level, asking repetitive questions
-
-**Late conversation (messages 7+):**
-- Focus: Clarity, decision support, action
-- Pace: More focused, helpful
-- Energy: "Let's get you sorted"
-- Avoid: Over-explaining, second-guessing their choices
-
-## THE PRODUCT RECOMMENDATION DANCE
-
-**CRITICAL: Products are the conclusion of understanding, not the start.**
-
-Think of it like this: A good doctor doesn't prescribe before diagnosing. You're doing the same.
-
-**Phase 1: Discovery (First 2-4 exchanges)**
-- Understand their situation
-- Ask open questions: "What's driving this need?" 
-- Notice what they emphasize
-- Pick up on emotional cues
-
-**Phase 2: Clarification (Next 1-3 exchanges)**
-- Get specific about requirements
-- Understand constraints (budget, timeline, scale)
-- Identify priorities: what matters MOST?
-- Ask choice-narrowing questions
-
-**Phase 3: Recommendation (Only after Phase 1 & 2)**
-- NOW you can suggest specific products
-- Frame it as guidance, not selling: "Based on everything you've told me..."
-- Explain WHY this fits them specifically
-- Give them confidence in the decision
-
-**Exception - Fast-track allowed:**
-- They name a specific product: "Tell me about your SEO package"
-- They're clearly ready: "I need X, show me options"
-- Follow-up questions in ongoing conversation
-- Simple factual questions: "What's your price?"
-
-**What this looks like:**
-
-❌ **Bad (too fast):**
-Customer: "I need marketing help"
-You: "Check out our Growth Package! {{Growth Package}}"
-
-✅ **Good (consultative):**
-Customer: "I need marketing help"
-You: "Got it. What's the main challenge you're facing - is it getting noticed or converting the traffic you have?"
-Customer: "Converting, we get decent traffic"
-You: "Ah okay. What's your current conversion rate looking like?"
-Customer: "Around 1%, we think there's room to improve"
-You: "Yeah, 1% definitely has upside. Are you mostly looking at improving your landing pages or the whole funnel?"
-Customer: "Probably the whole funnel honestly"
-You: "Makes sense. Based on what you're describing, our Conversion Optimization Program would be a strong fit - it's specifically designed to address that kind of challenge. {{Conversion Optimization Program}}"
-
-See the difference? The recommendation feels earned, not pushed.`);
-
-  // ============ CONVERSATION CONTEXT ============
-  if (conversationState.contextSummary) {
-    parts.push(`
-## CURRENT CONVERSATION CONTEXT
-${conversationState.contextSummary}`);
-  }
-
-  // ============ INTENT-SPECIFIC GUIDANCE ============
-  const intentGuidance = getIntentGuidance(
-    currentIntent,
-    conversationState,
-    language
-  );
-  if (intentGuidance) {
-    parts.push(`
-## WHAT THE CUSTOMER WANTS RIGHT NOW
-${intentGuidance}`);
-  }
-
-  // ============ JOURNEY-SPECIFIC BEHAVIOR ============
-  const journeyGuidance = getJourneyGuidance(
-    conversationState.journeyStage,
-    language
-  );
-  if (journeyGuidance) {
-    parts.push(`
-## HOW TO HELP AT THIS STAGE
-${journeyGuidance}`);
-  }
-
-  // ============ PRODUCT TAGGING ============
-  parts.push(`
-## WHEN TO USE PRODUCT TAGS
-
-Product tags {{Like This}} show product cards to the customer. Use them ONLY when you're genuinely recommending something specific.
-
-**Use tags when:**
-- You've built context and are making a considered recommendation
-- Customer asked about a specific product by name
-- You're answering "which should I choose?" after discussion
-- It's a natural conclusion to the conversation thread
-
-**Don't use tags when:**
-- You're still asking questions and gathering info
-- Giving general overviews or category descriptions
-- Building rapport or understanding needs
-- It's too early in the conversation (first 2-3 exchanges)
-
-**Reality check:** If you're using product tags in more than 30% of your messages, you're probably recommending too early.
-
-Format: {{Exact Product Name}} - always at the END of your message
-Maximum: 2 tags per message (for comparing options)`);
-
-  // ============ BOUNDARIES & AUTHENTICITY ============
-  parts.push(`
-## WHAT MAKES YOU TRUSTWORTHY
-
-**Be honest, always:**
-- Don't make up information or fake product details
-- If you're unsure, say so: "I'm not 100% certain, but..."
-- If you don't know, admit it: "That's outside what I can see, but..."
-
-**Be helpful, not salesy:**
-- Your job is to solve problems, not push products
-- If something isn't right for them, say so
-- It's okay if they don't buy - helping is the win
-
-**Be human, not perfect:**
-- You can ask for clarification: "Wait, did you mean X or Y?"
-- You can think aloud: "Hmm, let me consider that..."
-- You can rephrase: "Actually, better way to put that..."
-
-**Technical boundaries:**
-- Never include URLs or clickable links in your text
-- Don't list contact details unless asked
-- Keep responses conversational length (1-4 sentences typically)
-
-**The trust equation:** 
-Authenticity + Competence + Genuine Care = Trust
-You have all three. Use them.`);
-
-  // ============ HANDLING SPECIFIC PATTERNS ============
-  parts.push(`
-## HANDLING SHORT/CONTEXT-DEPENDENT RESPONSES
-When the customer says just "yes", "ja", "that", "it", "that one", etc.:
-- Look at the CONVERSATION CONTEXT above
-- Connect their response to what was just discussed
-- If they're saying yes to a question you asked, act on that
-- If referring to a product, use the {{Product Name}} tag
-
-When the customer says "no", "nej", "something else", "different":
-- DON'T immediately jump to a completely different category
-- First ask if they want OTHER options in the same category or something entirely different
-- Example: "Got it! Want to see other options in this category, or explore something different?"
-- Only if they confirm they want something different, then suggest other categories
-
-## HANDLING PRODUCTS WITH SIMILAR NAMES
-If there are multiple products with similar names:
-- Be specific about WHICH variant you're recommending (mention size, tier, or distinguishing features)
-- When listing options, clearly differentiate them
-- Always double-check details match the specific variant you're discussing
-
-## HANDLING "MORE" REQUESTS
-When the customer asks for more options:
-- Look through all relevant products in your data
-- Mention different tiers, sizes, or price ranges if available
-- Only say "that's all we have" if you've truly checked everything
-
-## YOUR NORTH STAR
-
-Remember what you're really doing here:
-
-You're not executing a script. You're not hitting KPIs. You're not "handling a customer."
-
-You're having a real conversation with a real person who has a real need. They came here because they're looking for something - a solution, guidance, help.
-
-Your job is simple: **Understand them. Then help them.**
-
-Every conversation is different. Some people know exactly what they want. Some are lost. Some are skeptical. Some are excited. Read the person, not the pattern.
-
-The best conversations don't feel like transactions. They feel like someone genuinely cared enough to understand and guide you to the right place.
-
-Be that person.
-
-**Core philosophy:**
-- Listen more than you speak (especially early on)
-- Understand before you advise
-- Care about getting it RIGHT for them
-- Products are the answer to their question, not the question itself
-- Trust is earned through authenticity, not perfection
-
-When in doubt, ask yourself: "Am I genuinely helping this person, or am I following a formula?"
-
-Always choose help.`);
-
-  return parts.join("\n");
 }
 
 /**
- * Get guidance specific to the detected intent
+ * Get quality statistics for a store
+ *
+ * @param {number} storeDbId - The store's database ID
+ * @param {number} days - Number of days to analyze
+ * @returns {Object} Quality statistics
  */
-function getIntentGuidance(currentIntent, conversationState, language) {
-  if (!currentIntent?.primary) return null;
+async function getQualityStats(storeDbId, days = 30) {
+  try {
+    const stats = await pool.query(
+      `SELECT 
+        COUNT(*) as total_scored,
+        AVG(quality_score) as avg_score,
+        COUNT(CASE WHEN quality_score >= 80 THEN 1 END) as excellent_count,
+        COUNT(CASE WHEN quality_score >= 60 AND quality_score < 80 THEN 1 END) as good_count,
+        COUNT(CASE WHEN quality_score >= 40 AND quality_score < 60 THEN 1 END) as fair_count,
+        COUNT(CASE WHEN quality_score < 40 THEN 1 END) as poor_count,
+        COUNT(CASE WHEN quality_flags IS NOT NULL AND quality_flags != '[]' THEN 1 END) as flagged_count
+       FROM conversations 
+       WHERE store_id = $1 
+         AND scored_at IS NOT NULL
+         AND started_at > now() - interval '${days} days'`,
+      [storeDbId]
+    );
 
-  const sv = language === "Swedish";
-  const intent = currentIntent.primary;
+    const row = stats.rows[0];
 
-  const guidance = {
-    [INTENTS.GREETING]: sv
-      ? "Kunden hälsar - svara vänligt och fråga vad de letar efter"
-      : "Customer is greeting - respond warmly and ask what they're looking for",
-
-    [INTENTS.BROWSE]: sv
-      ? "Kunden vill titta runt - föreslå populära produkter eller fråga vad som intresserar dem"
-      : "Customer wants to browse - suggest popular items or ask what interests them",
-
-    [INTENTS.SEARCH]: sv
-      ? "Kunden söker något specifikt - hjälp dem hitta det eller föreslå alternativ"
-      : "Customer is searching for something specific - help them find it or suggest alternatives",
-
-    [INTENTS.PRODUCT_INFO]: sv
-      ? "Kunden vill veta mer om en produkt - ge relevant info från produktdatan"
-      : "Customer wants product details - provide relevant info from the product data",
-
-    [INTENTS.COMPARE]: sv
-      ? "Kunden jämför produkter - lyft fram skillnader och hjälp dem välja"
-      : "Customer is comparing - highlight differences and help them choose",
-
-    [INTENTS.PRICE_CHECK]: sv
-      ? "Kunden frågar om pris - ge priset och nämn eventuellt värde/kvalitet"
-      : "Customer asks about price - give the price and maybe mention value/quality",
-
-    [INTENTS.RECOMMENDATION]: sv
-      ? "Kunden vill ha förslag - ge 1-2 personliga rekommendationer med anledning"
-      : "Customer wants suggestions - give 1-2 personalized recommendations with reasons",
-
-    [INTENTS.DECISION_HELP]: sv
-      ? "Kunden behöver hjälp att bestämma sig - var tydlig med din rekommendation"
-      : "Customer needs help deciding - be clear with your recommendation",
-
-    [INTENTS.PURCHASE]: sv
-      ? "Kunden vill köpa - bekräfta och berätta hur de går vidare (länk till produkten visas automatiskt)"
-      : "Customer wants to buy - confirm and tell them how to proceed (product link shows automatically)",
-
-    [INTENTS.AFFIRMATIVE]: conversationState.lastQuestion
-      ? sv
-        ? `Kunden säger JA till din fråga: "${conversationState.lastQuestion}" - agera på det`
-        : `Customer says YES to your question: "${conversationState.lastQuestion}" - act on it`
-      : sv
-      ? "Kunden bekräftar något - agera baserat på kontexten"
-      : "Customer is confirming - act based on context",
-
-    [INTENTS.NEGATIVE]: conversationState.lastProducts?.length
-      ? sv
-        ? `Kunden vill inte ha "${conversationState.lastProducts[0]}" - fråga om de vill se andra varianter av samma typ, eller något helt annat`
-        : `Customer doesn't want "${conversationState.lastProducts[0]}" - ask if they want other variants of the same type, or something different`
-      : sv
-      ? "Kunden säger nej - fråga vad de letar efter istället"
-      : "Customer says no - ask what they're looking for instead",
-
-    [INTENTS.CONTACT]: sv
-      ? "Kunden vill ha kontaktinfo - ge den tydligt och koncist"
-      : "Customer wants contact info - provide it clearly and concisely",
-
-    [INTENTS.SHIPPING]: sv
-      ? "Kunden frågar om frakt/leverans - svara om du har infon, annars hänvisa till kontakt"
-      : "Customer asks about shipping - answer if you have the info, otherwise direct to contact",
-
-    [INTENTS.RETURNS]: sv
-      ? "Kunden frågar om retur/garanti - svara om du har infon, annars hänvisa till kontakt"
-      : "Customer asks about returns - answer if you have the info, otherwise direct to contact",
-
-    [INTENTS.THANKS]: sv
-      ? "Kunden tackar - svara vänligt och fråga om det är något mer du kan hjälpa med"
-      : "Customer thanks you - respond warmly and ask if there's anything else",
-
-    [INTENTS.GOODBYE]: sv
-      ? "Kunden tar farväl - önska dem en trevlig dag"
-      : "Customer says goodbye - wish them a nice day",
-  };
-
-  return guidance[intent] || null;
+    return {
+      success: true,
+      period_days: days,
+      total_scored: parseInt(row.total_scored) || 0,
+      average_score: parseFloat(row.avg_score || 0).toFixed(1),
+      distribution: {
+        excellent: parseInt(row.excellent_count) || 0,
+        good: parseInt(row.good_count) || 0,
+        fair: parseInt(row.fair_count) || 0,
+        poor: parseInt(row.poor_count) || 0,
+      },
+      flagged_count: parseInt(row.flagged_count) || 0,
+    };
+  } catch (err) {
+    console.error("Error getting quality stats:", err);
+    return { success: false, error: err.message };
+  }
 }
 
 /**
- * Get guidance based on journey stage
+ * Get flagged conversations for review
+ *
+ * @param {number} storeDbId - The store's database ID
+ * @param {number} limit - Maximum number to return
+ * @returns {Array} Flagged conversations
  */
-function getJourneyGuidance(stage, language) {
-  if (!stage) return null;
+async function getFlaggedConversations(storeDbId, limit = 20) {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        c.id,
+        c.session_id,
+        c.started_at,
+        c.message_count,
+        c.quality_score,
+        c.quality_flags,
+        c.quality_summary,
+        c.reviewed_at
+       FROM conversations c
+       WHERE c.store_id = $1 
+         AND c.quality_flags IS NOT NULL 
+         AND c.quality_flags != '[]'
+       ORDER BY c.started_at DESC
+       LIMIT $2`,
+      [storeDbId, limit]
+    );
 
-  const sv = language === "Swedish";
-
-  const guidance = {
-    [JOURNEY_STAGES.EXPLORING]: sv
-      ? "Kunden utforskar - var välkomnande, ställ öppna frågor, försök förstå vad de behöver"
-      : "Customer is exploring - be welcoming, ask open questions, try to understand their needs",
-
-    [JOURNEY_STAGES.INTERESTED]: sv
-      ? "Kunden visar intresse - ge mer detaljer, lyft fram fördelar, bygg entusiasm"
-      : "Customer shows interest - give more details, highlight benefits, build enthusiasm",
-
-    [JOURNEY_STAGES.COMPARING]: sv
-      ? "Kunden jämför - var ärlig om skillnader, hjälp dem förstå vad som passar bäst"
-      : "Customer is comparing - be honest about differences, help them understand what fits best",
-
-    [JOURNEY_STAGES.DECIDING]: sv
-      ? "Kunden är redo att bestämma sig - ge en tydlig rekommendation, var självsäker"
-      : "Customer is ready to decide - give a clear recommendation, be confident",
-
-    [JOURNEY_STAGES.READY_TO_BUY]: sv
-      ? "Kunden vill köpa - bekräfta valet, produktkortet med köpknapp visas automatiskt"
-      : "Customer wants to buy - confirm the choice, product card with buy button shows automatically",
-
-    [JOURNEY_STAGES.SEEKING_HELP]: sv
-      ? "Kunden behöver hjälp/support - var extra hjälpsam och tydlig med info"
-      : "Customer needs help/support - be extra helpful and clear with info",
-
-    [JOURNEY_STAGES.CLOSING]: sv
-      ? "Konversationen avslutas - var vänlig, tacka dem, lämna dörren öppen för framtida frågor"
-      : "Conversation is closing - be warm, thank them, leave door open for future questions",
-  };
-
-  return guidance[stage] || null;
+    return {
+      success: true,
+      conversations: result.rows.map((row) => ({
+        id: row.id,
+        session_id: row.session_id,
+        started_at: row.started_at,
+        message_count: row.message_count,
+        score: row.quality_score,
+        flags: JSON.parse(row.quality_flags || "[]"),
+        summary: row.quality_summary,
+        reviewed: !!row.reviewed_at,
+      })),
+    };
+  } catch (err) {
+    console.error("Error getting flagged conversations:", err);
+    return { success: false, error: err.message };
+  }
 }
 
 /**
- * Build context message with RAG results
+ * Get a conversation with full details for review
+ *
+ * @param {number} conversationId - The conversation ID
+ * @param {number} storeDbId - The store's database ID (for authorization)
+ * @returns {Object} Full conversation details
  */
-function buildContextMessage(options = {}) {
-  const {
-    products = [],
-    pages = [],
-    facts = [],
-    conversationState = {},
-    currentIntent = {},
-    confidenceNote = "",
-  } = options;
+async function getConversationForReview(conversationId, storeDbId) {
+  try {
+    // Verify conversation belongs to store
+    const convResult = await pool.query(
+      `SELECT 
+        c.id,
+        c.session_id,
+        c.started_at,
+        c.ended_at,
+        c.message_count,
+        c.language,
+        c.device_type,
+        c.quality_score,
+        c.quality_flags,
+        c.quality_summary,
+        c.reviewed_at,
+        c.reviewer_notes
+       FROM conversations c
+       WHERE c.id = $1 AND c.store_id = $2`,
+      [conversationId, storeDbId]
+    );
 
-  let context = "[STORE DATA - use this to answer the customer]\n\n";
+    if (convResult.rowCount === 0) {
+      return { success: false, error: "Conversation not found" };
+    }
 
-  // Products
-  if (products.length > 0) {
-    context += "## PRODUCTS\n\n";
-    products.forEach((p, i) => {
-      context += `${i + 1}. **${p.item.title}**\n`;
-      if (p.item.price) context += `   Price: ${p.item.price}\n`;
-      if (p.item.content) {
-        const desc =
-          p.item.content.length > 350
-            ? p.item.content.slice(0, 350) + "..."
-            : p.item.content;
-        context += `   ${desc}\n`;
+    const conv = convResult.rows[0];
+
+    // Get messages
+    const messagesResult = await pool.query(
+      `SELECT role, content, products_shown, created_at 
+       FROM conv_messages 
+       WHERE conversation_id = $1 
+       ORDER BY created_at ASC`,
+      [conversationId]
+    );
+
+    // Get insights
+    const insightsResult = await pool.query(
+      `SELECT insight_type, value, confidence 
+       FROM conv_insights 
+       WHERE conversation_id = $1`,
+      [conversationId]
+    );
+
+    return {
+      success: true,
+      conversation: {
+        id: conv.id,
+        session_id: conv.session_id,
+        started_at: conv.started_at,
+        ended_at: conv.ended_at,
+        message_count: conv.message_count,
+        language: conv.language,
+        device_type: conv.device_type,
+        quality: {
+          score: conv.quality_score,
+          flags: JSON.parse(conv.quality_flags || "[]"),
+          summary: conv.quality_summary,
+        },
+        review: {
+          reviewed_at: conv.reviewed_at,
+          notes: conv.reviewer_notes,
+        },
+        messages: messagesResult.rows,
+        insights: insightsResult.rows.map((i) => ({
+          type: i.insight_type,
+          value: i.value,
+          confidence: i.confidence,
+        })),
+      },
+    };
+  } catch (err) {
+    console.error("Error getting conversation for review:", err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Mark a conversation as reviewed
+ *
+ * @param {number} conversationId - The conversation ID
+ * @param {number} storeDbId - The store's database ID
+ * @param {string} notes - Optional reviewer notes
+ * @returns {Object} Result
+ */
+async function markAsReviewed(conversationId, storeDbId, notes = null) {
+  try {
+    const result = await pool.query(
+      `UPDATE conversations 
+       SET reviewed_at = now(), reviewer_notes = $1
+       WHERE id = $2 AND store_id = $3
+       RETURNING id`,
+      [notes, conversationId, storeDbId]
+    );
+
+    if (result.rowCount === 0) {
+      return { success: false, error: "Conversation not found" };
+    }
+
+    return { success: true, conversation_id: conversationId };
+  } catch (err) {
+    console.error("Error marking conversation as reviewed:", err);
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Batch score unscored conversations
+ *
+ * @param {number} limit - Maximum number to process
+ * @returns {Object} Processing result
+ */
+async function batchScoreConversations(limit = 10) {
+  try {
+    const result = await pool.query(
+      `SELECT id, store_id 
+       FROM conversations 
+       WHERE status IN ('ended', 'processed')
+         AND scored_at IS NULL
+         AND message_count >= 2
+       ORDER BY ended_at ASC
+       LIMIT $1`,
+      [limit]
+    );
+
+    if (result.rowCount === 0) {
+      return { success: true, processed: 0 };
+    }
+
+    let processed = 0;
+    let errors = 0;
+
+    for (const row of result.rows) {
+      const scoreResult = await scoreAndUpdateConversation(row.id);
+      if (scoreResult.success) {
+        processed++;
+      } else {
+        errors++;
       }
-      context += "\n";
-    });
-  }
+    }
 
-  // Pages/info
-  if (pages.length > 0) {
-    context += "## STORE INFORMATION\n\n";
-    pages.forEach((p) => {
-      context += `### ${p.item.title}\n`;
-      context += `${p.item.content?.slice(0, 400) || ""}\n\n`;
-    });
+    return {
+      success: true,
+      processed,
+      errors,
+      total: result.rowCount,
+    };
+  } catch (err) {
+    console.error("Error batch scoring conversations:", err);
+    return { success: false, error: err.message };
   }
-
-  // Contact info (only if relevant)
-  if (facts.length > 0 && currentIntent?.primary === INTENTS.CONTACT) {
-    context += "## CONTACT INFO\n";
-    facts.forEach((f) => {
-      context += `- ${f.fact_type}: ${f.value}\n`;
-    });
-    context += "\n";
-  }
-
-  // Add confidence note if needed
-  if (confidenceNote) {
-    context += confidenceNote;
-  }
-
-  return context;
 }
 
 module.exports = {
-  buildSystemPrompt,
-  buildContextMessage,
-  TONE_DESCRIPTIONS,
+  scoreAndUpdateConversation,
+  getQualityStats,
+  getFlaggedConversations,
+  getConversationForReview,
+  markAsReviewed,
+  batchScoreConversations,
 };
