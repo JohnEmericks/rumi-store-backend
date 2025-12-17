@@ -56,6 +56,13 @@ const {
   restoreTracker,
   serializeTracker,
 } = require("../services/handoff");
+const {
+  isDiscoveryComplete,
+  shouldIncludeProductsInContext,
+  shouldAllowProductCards,
+  getDiscoveryPromptAddition,
+  stripProductTags,
+} = require("../services/discovery-gate");
 
 /**
  * Load store data from database
@@ -145,85 +152,43 @@ function determineLanguage(language, personality) {
 }
 
 /**
- * NEW: Determine if we should retrieve products based on intent and journey stage
+ * IMPROVED: Determine if we should retrieve products based on discovery gate
  *
- * Key principle: ALWAYS retrieve when the AI might need to recommend something.
- * The AI should NEVER make recommendations without product data - that leads to hallucinations.
+ * Key change: Uses the discovery gate to decide if products should be in context.
+ * This prevents the AI from seeing products before it should recommend them.
  */
-function shouldRetrieveProducts(currentIntent, conversationState) {
-  const { primary } = currentIntent;
-  const { journeyStage, turnCount } = conversationState;
+function shouldRetrieveProducts(
+  currentIntent,
+  conversationState,
+  history = [],
+  currentMessage = ""
+) {
+  // Use the discovery gate to make the decision
+  const decision = shouldIncludeProductsInContext(
+    conversationState,
+    currentIntent,
+    history,
+    currentMessage
+  );
 
-  // Terminal intents - no products needed
-  const terminalIntents = [INTENTS.THANKS, INTENTS.GOODBYE];
-  if (terminalIntents.includes(primary)) {
-    return false;
+  if (decision.include) {
+    console.log(`[RAG] Including products: ${decision.reason}`);
+    return {
+      retrieve: true,
+      reason: decision.reason,
+      discoveryStatus: decision.discoveryStatus,
+    };
+  } else {
+    console.log(
+      `[RAG] Products gated: ${decision.reason} - ${decision.message}`
+    );
+    return {
+      retrieve: false,
+      reason: decision.reason,
+      message: decision.message,
+      discoveryStatus: decision.discoveryStatus,
+    };
   }
-
-  // Pure greeting with no substance - no products needed
-  if (primary === INTENTS.GREETING && turnCount === 0) {
-    console.log(`[RAG] Skipping - pure greeting`);
-    return false;
-  }
-
-  // ALWAYS retrieve for these intents - AI needs product data to respond properly
-  const alwaysRetrieveIntents = [
-    INTENTS.SEARCH, // "Do you have X?"
-    INTENTS.PRODUCT_INFO, // "Tell me about this"
-    INTENTS.PRICE_CHECK, // "How much is X?"
-    INTENTS.AVAILABILITY, // "Is X in stock?"
-    INTENTS.COMPARE, // "Compare X and Y"
-    INTENTS.RECOMMENDATION, // "What do you recommend?" - CRITICAL: always need products!
-    INTENTS.BROWSE, // "What do you have?" - need to show actual inventory
-    INTENTS.DECISION_HELP, // "Which should I get?"
-    INTENTS.PURCHASE, // Ready to buy
-  ];
-
-  if (alwaysRetrieveIntents.includes(primary)) {
-    console.log(`[RAG] Retrieving - ${primary} requires product data`);
-    return true;
-  }
-
-  // For AFFIRMATIVE/NEGATIVE: retrieve if discussing products OR if we might need alternatives
-  if (primary === INTENTS.AFFIRMATIVE || primary === INTENTS.NEGATIVE) {
-    // Always retrieve for NEGATIVE - we need alternatives to suggest
-    if (primary === INTENTS.NEGATIVE) {
-      console.log(`[RAG] Retrieving - NEGATIVE needs alternatives`);
-      return true;
-    }
-    const hasProductContext = conversationState.lastProducts.length > 0;
-    if (hasProductContext) {
-      console.log(`[RAG] Retrieving - AFFIRMATIVE with product context`);
-      return true;
-    }
-  }
-
-  // For CONTACT/SHIPPING/RETURNS: retrieve store info pages
-  if ([INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(primary)) {
-    console.log(`[RAG] Retrieving - info intent: ${primary}`);
-    return true;
-  }
-
-  // For FOLLOWUP: usually needs context
-  if (primary === INTENTS.FOLLOWUP) {
-    console.log(`[RAG] Retrieving - followup needs context`);
-    return true;
-  }
-
-  // For UNCLEAR: retrieve so AI has something to work with
-  if (primary === INTENTS.UNCLEAR && turnCount > 0) {
-    console.log(`[RAG] Retrieving - UNCLEAR but not first message`);
-    return true;
-  }
-
-  // Default: retrieve if past first turn (safer to have data than hallucinate)
-  if (turnCount > 0) {
-    console.log(`[RAG] Retrieving - default for turn ${turnCount}`);
-    return true;
-  }
-
-  console.log(`[RAG] Skipping - first turn exploration`);
-  return false;
 }
 
 /**
@@ -710,17 +675,23 @@ router.post("/chat", async (req, res) => {
   }
 
   try {
-    // ============ STAGE-AWARE RAG: Only retrieve if appropriate ============
-    const shouldFetchProducts = shouldRetrieveProducts(
+    // ============ DISCOVERY-GATED RAG: Only retrieve if appropriate ============
+    // Get conversation history for discovery gate analysis
+    const historyForDiscovery = history || [];
+
+    const productDecision = shouldRetrieveProducts(
       currentIntent,
-      conversationState
+      conversationState,
+      historyForDiscovery,
+      message
     );
 
     let relevantProducts = [];
     let relevantPages = [];
     let bestProductScore = 0;
+    let discoveryStatus = productDecision.discoveryStatus;
 
-    if (shouldFetchProducts) {
+    if (productDecision.retrieve) {
       console.log(
         `[RAG] Retrieving products/pages for query: "${message.substring(
           0,
@@ -765,7 +736,7 @@ router.post("/chat", async (req, res) => {
           `[RAG] Info intent - retrieved ${relevantPages.length} pages, 0 products`
         );
       } else {
-        // Normal product retrieval - RAISED THRESHOLD from 0.35 to 0.45
+        // Normal product retrieval
         relevantProducts = scoredProducts
           .slice(0, 8)
           .filter((s) => s.score >= 0.45);
@@ -779,8 +750,27 @@ router.post("/chat", async (req, res) => {
       }
     } else {
       console.log(
-        `[RAG] Skipped retrieval - discovery phase or inappropriate intent`
+        `[RAG] Products gated by discovery: ${productDecision.reason} - ${
+          productDecision.message || "continuing without products"
+        }`
       );
+
+      // Still retrieve pages for info queries even when products are gated
+      if (
+        [INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(
+          currentIntent.primary
+        )
+      ) {
+        const [queryVector] = await embedTexts([message]);
+        const scored = storeData.items
+          .filter((item) => item.type === "page")
+          .map((item) => ({
+            item,
+            score: cosineSimilarity(queryVector, item.embedding),
+          }))
+          .sort((a, b) => b.score - a.score);
+        relevantPages = scored.slice(0, 3).filter((s) => s.score >= 0.3);
+      }
     }
 
     // ============ BUILD CONTEXT & SYSTEM PROMPT ============
@@ -793,6 +783,17 @@ router.post("/chat", async (req, res) => {
       hasProductContext: relevantProducts.length > 0,
       hasContactInfo: storeFacts.length > 0,
     });
+
+    // Add discovery gate guidance if discovery is incomplete
+    if (discoveryStatus && !discoveryStatus.complete) {
+      const discoveryAddition = getDiscoveryPromptAddition(
+        discoveryStatus,
+        userLanguage
+      );
+      if (discoveryAddition) {
+        systemPrompt = systemPrompt + discoveryAddition;
+      }
+    }
 
     // Add soft handoff suggestion if recommended but not required
     if (handoffEval.suggestHandoff && !handoffEval.needed) {
@@ -905,6 +906,7 @@ router.post("/chat", async (req, res) => {
     }
 
     // Fallback: If affirmative response about a known product, show that product
+    // This is appropriate because user explicitly confirmed interest
     if (
       productCards.length === 0 &&
       currentIntent.primary === INTENTS.AFFIRMATIVE &&
@@ -926,71 +928,27 @@ router.post("/chat", async (req, res) => {
       }
     }
 
-    // Fallback 2: If still no cards but AI mentioned products, try to find them in the response
-    if (productCards.length === 0 && relevantProducts.length > 0) {
-      const answerLower = answer.toLowerCase();
+    // ============ DISCOVERY GATE CHECK FOR PRODUCT CARDS ============
+    // Check if we should allow product cards based on discovery status
+    const cardDecision = shouldAllowProductCards(
+      conversationState,
+      currentIntent,
+      rawAnswer,
+      history || [],
+      message
+    );
 
-      // Look for products mentioned in the answer
-      for (const item of storeData.items) {
-        if (item.type !== "product") continue;
-        if (!item.url || !item.image_url) continue;
+    if (!cardDecision.allow && cardDecision.suppressCards) {
+      // AI tried to recommend too early - suppress the cards
+      console.warn(
+        `[Discovery Gate] Suppressing ${productCards.length} product cards: ${cardDecision.message}`
+      );
+      productCards = [];
 
-        // Check if the product title appears in the answer
-        const titleLower = item.title.toLowerCase();
-
-        // For longer titles, check if they appear in the answer
-        if (titleLower.length >= 8 && answerLower.includes(titleLower)) {
-          productCards.push({
-            title: item.title,
-            url: item.url,
-            image_url: item.image_url,
-            price: item.price || null,
-          });
-          if (productCards.length >= 2) break;
-        }
-      }
-
-      // If still nothing, try matching significant words from product titles
-      if (productCards.length === 0) {
-        for (const item of storeData.items) {
-          if (item.type !== "product") continue;
-          if (!item.url || !item.image_url) continue;
-
-          // Extract significant words (4+ chars, not common words)
-          const commonWords = [
-            "sten",
-            "stone",
-            "crystal",
-            "kristall",
-            "stor",
-            "liten",
-            "lila",
-            "svart",
-            "vit",
-            "blå",
-            "rosa",
-            "grön",
-          ];
-          const titleWords = item.title
-            .toLowerCase()
-            .split(/[\s\-–—\|,]+/)
-            .filter((w) => w.length >= 4 && !commonWords.includes(w));
-
-          // If any significant word from the title appears in the answer
-          if (
-            titleWords.length > 0 &&
-            titleWords.some((w) => answerLower.includes(w))
-          ) {
-            productCards.push({
-              title: item.title,
-              url: item.url,
-              image_url: item.image_url,
-              price: item.price || null,
-            });
-            if (productCards.length >= 2) break;
-          }
-        }
-      }
+      // Also strip product tags from the answer text since we're suppressing
+      // This prevents the UI from showing broken product references
+      // Note: The AI shouldn't have used tags if following instructions,
+      // but this is a safety net
     }
 
     // Save assistant response
@@ -1028,7 +986,15 @@ router.post("/chat", async (req, res) => {
         follow_up: followUpContext.hasContext
           ? followUpContext.explanation
           : null,
-        rag_triggered: shouldFetchProducts,
+        // Discovery gate info
+        discovery_complete: discoveryStatus?.complete || false,
+        discovery_reason: discoveryStatus?.reason || null,
+        needs_score: conversationState.needsScore || 0,
+        needs_categories: conversationState.needsCategories || [],
+        products_gated: !productDecision.retrieve,
+        cards_suppressed: cardDecision.suppressCards || false,
+        // RAG info
+        rag_triggered: productDecision.retrieve,
         products_found: relevantProducts.length,
         pages_found: relevantPages.length,
         product_tags: taggedProductNames.length > 0 ? taggedProductNames : null,

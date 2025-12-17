@@ -1,10 +1,14 @@
 /**
- * Conversation State Service
+ * Conversation State Service (IMPROVED)
  *
  * Tracks and analyzes conversation state including:
- * - Journey stage detection
+ * - Journey stage detection (now needs-based, not just turn-based!)
  * - Context building from history
  * - Follow-up context resolution
+ * - Needs extraction and scoring
+ *
+ * Key improvement: Stage advancement is based on ACTUAL customer signals,
+ * not just counting turns.
  */
 
 const { INTENTS } = require("./intent-classifier");
@@ -23,38 +27,142 @@ const JOURNEY_STAGES = {
 };
 
 /**
- * Determine the journey stage based on conversation history and current intent
+ * Needs indicators with weights for scoring
+ * This is used to determine if customer has expressed enough needs
+ */
+const NEEDS_INDICATORS = [
+  // Purpose/recipient (strong)
+  { pattern: /present|gift|gåva/i, weight: 2, category: "purpose" },
+  {
+    pattern: /for (my|a|an|the|min|mitt|mina|en|ett)\s+\w+/i,
+    weight: 2,
+    category: "recipient",
+  },
+  {
+    pattern:
+      /mom|mamma|dad|pappa|friend|vän|wife|fru|husband|man|girlfriend|boyfriend|partner|son|daughter|dotter|barn/i,
+    weight: 2,
+    category: "recipient",
+  },
+
+  // Occasion (strong)
+  {
+    pattern:
+      /birthday|christmas|wedding|anniversary|valentine|jul|födelsedag|bröllop/i,
+    weight: 2,
+    category: "occasion",
+  },
+
+  // Budget (very strong)
+  {
+    pattern: /budget|under \d+|max \d+|around \d+|cirka \d+|ungefär \d+/i,
+    weight: 3,
+    category: "budget",
+  },
+  { pattern: /\d+\s*(kr|sek|kronor|\$|€)/i, weight: 2, category: "budget" },
+
+  // Preferences (medium)
+  {
+    pattern: /colou?r|färg|size|storlek|style|stil|type|typ/i,
+    weight: 1,
+    category: "preference",
+  },
+  {
+    pattern: /prefer|föredrar|like|gillar|love|älskar|want|vill/i,
+    weight: 1,
+    category: "preference",
+  },
+
+  // Use case (medium)
+  {
+    pattern: /meditation|healing|decoration|dekoration|collection|samling/i,
+    weight: 2,
+    category: "usecase",
+  },
+  {
+    pattern: /beginner|nybörjare|first time|första|experienced|erfaren/i,
+    weight: 2,
+    category: "experience",
+  },
+];
+
+const MINIMUM_NEEDS_SCORE = 3;
+
+/**
+ * Calculate needs score from conversation history
+ */
+function calculateNeedsScore(history, currentMessage) {
+  const allUserMessages = [
+    currentMessage,
+    ...history.filter((m) => m.role === "user").map((m) => m.content),
+  ].join(" ");
+
+  let score = 0;
+  const categories = new Set();
+
+  for (const { pattern, weight, category } of NEEDS_INDICATORS) {
+    if (pattern.test(allUserMessages)) {
+      score += weight;
+      categories.add(category);
+    }
+  }
+
+  return {
+    score,
+    categories: Array.from(categories),
+    sufficient: score >= MINIMUM_NEEDS_SCORE,
+  };
+}
+
+/**
+ * IMPROVED: Determine the journey stage based on ACTUAL customer signals
+ * Not just turn count!
+ *
+ * Key changes:
+ * - EXPLORING stays until real needs are expressed
+ * - INTERESTED requires expressed needs
+ * - DECIDING requires needs + product discussion
+ * - Turn count is a secondary factor, not primary
  */
 function determineJourneyStage(history, currentIntent, extractedContext) {
   const { primary } = currentIntent;
   const turnCount = Math.floor(history.length / 2);
 
-  // Terminal stages
+  // ===== TERMINAL STAGES (always take priority) =====
+
+  // Closing stage
   if ([INTENTS.GOODBYE, INTENTS.THANKS].includes(primary)) {
     return JOURNEY_STAGES.CLOSING;
   }
 
-  // Support/help stages
+  // Support/help stage
   if ([INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(primary)) {
     return JOURNEY_STAGES.SEEKING_HELP;
   }
 
-  // Purchase intent
+  // ===== PURCHASE-RELATED STAGES =====
+
+  // Ready to buy - explicit purchase intent
   if (primary === INTENTS.PURCHASE) {
     return JOURNEY_STAGES.READY_TO_BUY;
   }
 
-  // Comparison stage
+  // Ready to buy - affirmative after product discussion
+  if (
+    primary === INTENTS.AFFIRMATIVE &&
+    extractedContext.lastProducts.length > 0
+  ) {
+    return JOURNEY_STAGES.READY_TO_BUY;
+  }
+
+  // ===== PRODUCT-FOCUSED STAGES =====
+
+  // Comparison stage - actively comparing products
   if (primary === INTENTS.COMPARE) {
     return JOURNEY_STAGES.COMPARING;
   }
 
-  // Decision help
-  if (primary === INTENTS.DECISION_HELP) {
-    return JOURNEY_STAGES.DECIDING;
-  }
-
-  // If we have product context and they're asking about specific products
+  // Comparing - asking about specific products we've discussed
   if (
     extractedContext.lastProducts.length > 0 &&
     [INTENTS.PRODUCT_INFO, INTENTS.PRICE_CHECK, INTENTS.AVAILABILITY].includes(
@@ -64,39 +172,70 @@ function determineJourneyStage(history, currentIntent, extractedContext) {
     return JOURNEY_STAGES.COMPARING;
   }
 
-  // Affirmative after product discussion suggests ready to buy
-  if (
-    primary === INTENTS.AFFIRMATIVE &&
-    extractedContext.lastProducts.length > 0
-  ) {
-    return JOURNEY_STAGES.READY_TO_BUY;
+  // Decision help - explicit request for recommendation after context
+  if (primary === INTENTS.DECISION_HELP) {
+    // Only go to DECIDING if we have context, otherwise stay INTERESTED
+    if (
+      extractedContext.hasExpressedNeeds ||
+      extractedContext.lastProducts.length > 0
+    ) {
+      return JOURNEY_STAGES.DECIDING;
+    }
+    return JOURNEY_STAGES.INTERESTED;
   }
 
-  // Searching or asking for recommendations with some context
+  // ===== DISCOVERY STAGES (the key improvement!) =====
+
+  // If they're asking for recommendations, check if we have enough context
+  if (primary === INTENTS.RECOMMENDATION) {
+    if (extractedContext.hasExpressedNeeds && turnCount >= 2) {
+      return JOURNEY_STAGES.DECIDING;
+    }
+    // Not enough context yet - stay in INTERESTED to gather more info
+    return JOURNEY_STAGES.INTERESTED;
+  }
+
+  // If we've discussed products and they're searching for more
+  if (primary === INTENTS.SEARCH && extractedContext.lastProducts.length > 0) {
+    return JOURNEY_STAGES.COMPARING;
+  }
+
+  // ===== DEFAULT PROGRESSION (needs-based, not turn-based!) =====
+
+  // EXPLORING: No needs expressed yet, OR very early conversation
+  if (!extractedContext.hasExpressedNeeds || turnCount < 2) {
+    return JOURNEY_STAGES.EXPLORING;
+  }
+
+  // INTERESTED: Has expressed needs but no products discussed yet
   if (
-    [INTENTS.SEARCH, INTENTS.RECOMMENDATION].includes(primary) &&
-    turnCount >= 1
+    extractedContext.hasExpressedNeeds &&
+    extractedContext.lastProducts.length === 0
   ) {
-    return extractedContext.hasExpressedNeeds
+    // Even with high turn count, don't jump to DECIDING without product discussion
+    if (turnCount >= 4) {
+      // After many turns with needs but no products, they might be ready
+      return JOURNEY_STAGES.DECIDING;
+    }
+    return JOURNEY_STAGES.INTERESTED;
+  }
+
+  // DECIDING: Has expressed needs AND seen products
+  if (
+    extractedContext.hasExpressedNeeds &&
+    extractedContext.lastProducts.length > 0
+  ) {
+    return JOURNEY_STAGES.DECIDING;
+  }
+
+  // Very high turn count override (conversation might be stuck)
+  if (turnCount >= 6) {
+    return extractedContext.lastProducts.length > 0
       ? JOURNEY_STAGES.DECIDING
       : JOURNEY_STAGES.INTERESTED;
   }
 
-  // Early conversation or browsing
-  if (
-    turnCount < 2 ||
-    [INTENTS.GREETING, INTENTS.BROWSE, INTENTS.UNCLEAR].includes(primary)
-  ) {
-    return JOURNEY_STAGES.EXPLORING;
-  }
-
-  // Default based on turn count
-  if (turnCount >= 4) {
-    return JOURNEY_STAGES.DECIDING;
-  } else if (turnCount >= 2) {
-    return JOURNEY_STAGES.INTERESTED;
-  }
-
+  // Default: stay in exploration
   return JOURNEY_STAGES.EXPLORING;
 }
 
@@ -151,77 +290,104 @@ function extractLastQuestion(history) {
 }
 
 /**
- * Check if user has expressed specific needs or preferences
+ * IMPROVED: Check if user has expressed specific needs or preferences
+ * Now uses weighted scoring for more accurate detection
  */
 function hasExpressedNeeds(history, currentMessage) {
-  const needIndicators = [
-    // Swedish
-    /letar efter/i,
-    /söker/i,
-    /behöver/i,
-    /vill ha/i,
-    /för (min|mitt|mina|en|ett)/i,
-    /present/i,
-    /budget/i,
-    /passar för/i,
-    // English
-    /looking for/i,
-    /searching/i,
-    /need/i,
-    /want/i,
-    /for (my|a|an)/i,
-    /gift/i,
-    /budget/i,
-    /suitable for/i,
-  ];
-
-  // Check current message
-  for (const pattern of needIndicators) {
-    if (pattern.test(currentMessage)) {
-      return true;
-    }
-  }
-
-  // Check history
-  for (const msg of history) {
-    if (msg.role === "user") {
-      for (const pattern of needIndicators) {
-        if (pattern.test(msg.content)) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
+  const needsAnalysis = calculateNeedsScore(history, currentMessage);
+  return needsAnalysis.sufficient;
 }
 
 /**
- * Build a context summary from the conversation
+ * IMPROVED: Build a context summary from the conversation
+ * Now includes needs categories for better AI context
  */
 function buildContextSummary(history, currentMessage, extractedContext) {
   const parts = [];
 
+  // Products discussed
   if (extractedContext.lastProducts.length > 0) {
     parts.push(
-      `Products discussed: ${extractedContext.lastProducts.slice(-3).join(", ")}`
+      `Products discussed: ${extractedContext.lastProducts
+        .slice(-3)
+        .join(", ")}`
     );
   }
 
+  // Last question
   if (extractedContext.lastQuestion) {
     parts.push(`Last question asked: "${extractedContext.lastQuestion}"`);
   }
 
+  // Needs status with categories
   if (extractedContext.hasExpressedNeeds) {
-    parts.push("Customer has expressed specific needs/preferences");
+    const needsAnalysis = calculateNeedsScore(history, currentMessage);
+    if (needsAnalysis.categories.length > 0) {
+      parts.push(`Customer mentioned: ${needsAnalysis.categories.join(", ")}`);
+    } else {
+      parts.push("Customer has expressed specific needs/preferences");
+    }
   }
 
+  // Turn count
   const turnCount = Math.floor(history.length / 2);
   if (turnCount > 0) {
     parts.push(`Conversation turn: ${turnCount + 1}`);
   }
 
   return parts.length > 0 ? parts.join(" | ") : null;
+}
+
+/**
+ * Extract specific needs details from conversation
+ * Useful for building targeted recommendations
+ */
+function extractNeedsDetails(history, currentMessage) {
+  const allUserMessages = [
+    currentMessage,
+    ...history.filter((m) => m.role === "user").map((m) => m.content),
+  ].join(" ");
+
+  const needs = {
+    recipient: null,
+    occasion: null,
+    budget: null,
+    preferences: [],
+    useCase: null,
+    experience: null,
+  };
+
+  // Extract recipient
+  const recipientMatch = allUserMessages.match(
+    /(?:for |till |åt )?(my |min |mitt )?(mom|mamma|dad|pappa|friend|vän|wife|fru|husband|man|girlfriend|boyfriend|partner|myself|mig själv)/i
+  );
+  if (recipientMatch) needs.recipient = recipientMatch[0].trim();
+
+  // Extract occasion
+  const occasionMatch = allUserMessages.match(
+    /(birthday|christmas|wedding|anniversary|valentine|jul|födelsedag|bröllop)/i
+  );
+  if (occasionMatch) needs.occasion = occasionMatch[0];
+
+  // Extract budget
+  const budgetMatch = allUserMessages.match(
+    /(under|max|around|cirka|ungefär|budget)\s*\d+\s*(kr|sek|kronor|\$|€)?/i
+  );
+  if (budgetMatch) needs.budget = budgetMatch[0];
+
+  // Extract use case
+  const useCaseMatch = allUserMessages.match(
+    /(meditation|healing|decoration|dekoration|collection|everyday|vardag)/i
+  );
+  if (useCaseMatch) needs.useCase = useCaseMatch[0];
+
+  // Extract experience level
+  const experienceMatch = allUserMessages.match(
+    /(beginner|nybörjare|first time|första|experienced|erfaren)/i
+  );
+  if (experienceMatch) needs.experience = experienceMatch[0];
+
+  return needs;
 }
 
 /**
@@ -232,16 +398,25 @@ function buildContextSummary(history, currentMessage, extractedContext) {
  * @param {Object} currentIntent - The classified intent for current message
  * @returns {Object} Conversation state object
  */
-function buildConversationState(history = [], currentMessage = "", currentIntent = {}) {
+function buildConversationState(
+  history = [],
+  currentMessage = "",
+  currentIntent = {}
+) {
   // Extract context from history
   const lastProducts = extractProductsFromHistory(history);
   const lastQuestion = extractLastQuestion(history);
   const expressedNeeds = hasExpressedNeeds(history, currentMessage);
+  const needsDetails = extractNeedsDetails(history, currentMessage);
+  const needsAnalysis = calculateNeedsScore(history, currentMessage);
 
   const extractedContext = {
     lastProducts,
     lastQuestion,
     hasExpressedNeeds: expressedNeeds,
+    needsDetails,
+    needsScore: needsAnalysis.score,
+    needsCategories: needsAnalysis.categories,
   };
 
   // Determine journey stage
@@ -264,6 +439,9 @@ function buildConversationState(history = [], currentMessage = "", currentIntent
     lastProducts,
     lastQuestion,
     hasExpressedNeeds: expressedNeeds,
+    needsDetails,
+    needsScore: needsAnalysis.score,
+    needsCategories: needsAnalysis.categories,
     contextSummary,
     messageCount: history.length,
   };
@@ -293,7 +471,9 @@ function getFollowUpContext(conversationState, currentIntent) {
     if (lastProducts.length > 0) {
       return {
         hasContext: true,
-        explanation: `User confirmed interest in: ${lastProducts[lastProducts.length - 1]}`,
+        explanation: `User confirmed interest in: ${
+          lastProducts[lastProducts.length - 1]
+        }`,
         type: "product_confirmation",
         referent: lastProducts[lastProducts.length - 1],
       };
@@ -323,7 +503,9 @@ function getFollowUpContext(conversationState, currentIntent) {
   if (primary === INTENTS.PRODUCT_INFO && lastProducts.length > 0) {
     return {
       hasContext: true,
-      explanation: `User asking about previously mentioned product(s): ${lastProducts.slice(-2).join(", ")}`,
+      explanation: `User asking about previously mentioned product(s): ${lastProducts
+        .slice(-2)
+        .join(", ")}`,
       type: "product_followup",
       referent: lastProducts[lastProducts.length - 1],
     };
@@ -334,7 +516,9 @@ function getFollowUpContext(conversationState, currentIntent) {
     if (lastProducts.length > 0) {
       return {
         hasContext: true,
-        explanation: `User wants more info after discussing: ${lastProducts.slice(-2).join(", ")}`,
+        explanation: `User wants more info after discussing: ${lastProducts
+          .slice(-2)
+          .join(", ")}`,
         type: "continuation",
         referent: lastProducts,
       };
@@ -362,4 +546,8 @@ module.exports = {
   determineJourneyStage,
   extractProductsFromHistory,
   extractLastQuestion,
+  hasExpressedNeeds,
+  calculateNeedsScore,
+  extractNeedsDetails,
+  MINIMUM_NEEDS_SCORE,
 };
