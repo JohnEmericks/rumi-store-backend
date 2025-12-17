@@ -154,89 +154,83 @@ function determineLanguage(language, personality) {
 /**
  * NEW: Determine if we should retrieve products based on intent and journey stage
  *
- * Key principle: Don't overwhelm users with products during discovery phase.
- * Only retrieve products when:
- * 1. User asks for something specific
- * 2. We've already established what they need
- * 3. They're in a later journey stage
+ * Key principle: ALWAYS retrieve when the AI might need to recommend something.
+ * The AI should NEVER make recommendations without product data - that leads to hallucinations.
  */
 function shouldRetrieveProducts(currentIntent, conversationState) {
   const { primary } = currentIntent;
   const { journeyStage, turnCount } = conversationState;
 
-  // NEVER retrieve products for these intents (they're just exploring)
-  const explorationIntents = [
-    INTENTS.GREETING,
-    INTENTS.BROWSE, // "What do you have?"
-    INTENTS.UNCLEAR, // "Not sure what I'm looking for"
-  ];
+  // Terminal intents - no products needed
+  const terminalIntents = [INTENTS.THANKS, INTENTS.GOODBYE];
+  if (terminalIntents.includes(primary)) {
+    return false;
+  }
 
-  // ALWAYS retrieve for these (they know what they want or are asking about specific products)
-  const productIntents = [
+  // Pure greeting with no substance - no products needed
+  if (primary === INTENTS.GREETING && turnCount === 0) {
+    console.log(`[RAG] Skipping - pure greeting`);
+    return false;
+  }
+
+  // ALWAYS retrieve for these intents - AI needs product data to respond properly
+  const alwaysRetrieveIntents = [
     INTENTS.SEARCH, // "Do you have X?"
     INTENTS.PRODUCT_INFO, // "Tell me about this"
     INTENTS.PRICE_CHECK, // "How much is X?"
     INTENTS.AVAILABILITY, // "Is X in stock?"
     INTENTS.COMPARE, // "Compare X and Y"
+    INTENTS.RECOMMENDATION, // "What do you recommend?" - CRITICAL: always need products!
+    INTENTS.BROWSE, // "What do you have?" - need to show actual inventory
+    INTENTS.DECISION_HELP, // "Which should I get?"
+    INTENTS.PURCHASE, // Ready to buy
   ];
 
-  // Terminal intents - no products needed
-  const terminalIntents = [INTENTS.THANKS, INTENTS.GOODBYE];
-
-  // 1. Never retrieve for terminal intents
-  if (terminalIntents.includes(primary)) {
-    return false;
-  }
-
-  // 2. Never retrieve for exploration intents
-  if (explorationIntents.includes(primary)) {
-    console.log(`[RAG] Skipping - exploration intent: ${primary}`);
-    return false;
-  }
-
-  // 3. Always retrieve for direct product questions
-  if (productIntents.includes(primary)) {
-    console.log(`[RAG] Retrieving - product intent: ${primary}`);
+  if (alwaysRetrieveIntents.includes(primary)) {
+    console.log(`[RAG] Retrieving - ${primary} requires product data`);
     return true;
   }
 
-  // 4. For RECOMMENDATION intent: only retrieve if we have context
-  if (primary === INTENTS.RECOMMENDATION) {
-    // If we're still in early exploration (< 2 turns), ask questions first
-    if (journeyStage === JOURNEY_STAGES.EXPLORING && turnCount < 2) {
-      console.log(
-        `[RAG] Skipping - RECOMMENDATION too early (turn ${turnCount})`
-      );
-      return false;
-    }
-    // Otherwise, retrieve
-    console.log(
-      `[RAG] Retrieving - RECOMMENDATION with context (turn ${turnCount})`
-    );
-    return true;
-  }
-
-  // 5. For AFFIRMATIVE/NEGATIVE: only retrieve if discussing products
+  // For AFFIRMATIVE/NEGATIVE: retrieve if discussing products OR if we might need alternatives
   if (primary === INTENTS.AFFIRMATIVE || primary === INTENTS.NEGATIVE) {
-    const hasProductContext = conversationState.lastProducts.length > 0;
-    if (!hasProductContext) {
-      console.log(`[RAG] Skipping - ${primary} without product context`);
+    // Always retrieve for NEGATIVE - we need alternatives to suggest
+    if (primary === INTENTS.NEGATIVE) {
+      console.log(`[RAG] Retrieving - NEGATIVE needs alternatives`);
+      return true;
     }
-    return hasProductContext;
+    const hasProductContext = conversationState.lastProducts.length > 0;
+    if (hasProductContext) {
+      console.log(`[RAG] Retrieving - AFFIRMATIVE with product context`);
+      return true;
+    }
   }
 
-  // 6. For CONTACT/SHIPPING/RETURNS: retrieve store info pages, not products
+  // For CONTACT/SHIPPING/RETURNS: retrieve store info pages
   if ([INTENTS.CONTACT, INTENTS.SHIPPING, INTENTS.RETURNS].includes(primary)) {
     console.log(`[RAG] Retrieving - info intent: ${primary}`);
-    return true; // Will filter to only pages in RAG logic
+    return true;
   }
 
-  // 7. Default: only retrieve if past exploration stage
-  const shouldRetrieve = journeyStage !== JOURNEY_STAGES.EXPLORING;
-  if (!shouldRetrieve) {
-    console.log(`[RAG] Skipping - still in EXPLORING stage`);
+  // For FOLLOWUP: usually needs context
+  if (primary === INTENTS.FOLLOWUP) {
+    console.log(`[RAG] Retrieving - followup needs context`);
+    return true;
   }
-  return shouldRetrieve;
+
+  // For UNCLEAR: retrieve so AI has something to work with
+  if (primary === INTENTS.UNCLEAR && turnCount > 0) {
+    console.log(`[RAG] Retrieving - UNCLEAR but not first message`);
+    return true;
+  }
+
+  // Default: retrieve if past first turn (safer to have data than hallucinate)
+  if (turnCount > 0) {
+    console.log(`[RAG] Retrieving - default for turn ${turnCount}`);
+    return true;
+  }
+
+  console.log(`[RAG] Skipping - first turn exploration`);
+  return false;
 }
 
 /**

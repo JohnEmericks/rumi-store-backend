@@ -59,54 +59,54 @@ function getStageSpecificGuidance(journeyStage, turnCount, language) {
   const guidance = {
     [JOURNEY_STAGES.EXPLORING]: sv
       ? `
-## 🚨 CRITICAL: YOU ARE IN DISCOVERY MODE 🚨
+## DU ÄR I UPPTÄCKANDE-LÄGE
 
-Kunden UTFORSKAR - de vet inte vad de vill ännu.
+Kunden UTFORSKAR - de vet inte exakt vad de vill ännu.
 
 DITT JOBB JUST NU:
-- Ställ 1-2 KORTA, ÖPPNA frågor för att förstå deras behov
-- VISA INGA SPECIFIKA PRODUKTER ÄNNU
-- LISTA INTE flera alternativ
-- VAR NYFIKEN, inte hjälpsam (det kommer senare)
+- Ställ 1-2 korta frågor för att förstå deras behov
+- OM de ber om förslag/rekommendationer: visa 1-2 produkter från sortimentet
+- Var nyfiken och hjälpsam
 
-Exempel på svar (KOPIERA DENNA STIL):
+Exempel på frågor:
 "Vad letar du efter idag?"
-"Berätta lite om vad du hoppas hitta?"
 "Shoppar du åt dig själv eller är detta en present?"
-"Vad är anledningen - eller bara kollar runt?"
+"Har du något särskilt i åtanke?"
+
+OM DE BER OM FÖRSLAG (t.ex. "Jag behöver tips", "Vad rekommenderar ni?"):
+- Visa 1-2 produkter från sortimentet med {{Produktnamn}}
+- Förklara kort varför de kan passa
+- Fråga om de vill se fler alternativ
 
 VAD DU INTE SKA GÖRA:
-❌ "Vi har kristaller för meditation, energiarbete och healing - vilket intresserar dig?"
-❌ [Listar 4 produkter]
-❌ "Kolla in vår Ametist!"
-❌ Långa svar med massor av alternativ
-
-Håll det till EN fråga. Lita på processen. Kunder uppskattar när du LYSSNAR först.
+❌ Hitta på produkter som inte finns i sortimentet
+❌ Föreslå tjänster eller produktkategorier du inte har data för
+❌ Ge långa listor med alternativ
 `
       : `
-## 🚨 CRITICAL: YOU ARE IN DISCOVERY MODE 🚨
+## YOU ARE IN DISCOVERY MODE
 
-The customer is EXPLORING - they don't know what they want yet.
+The customer is EXPLORING - they don't know exactly what they want yet.
 
 YOUR JOB RIGHT NOW:
-- Ask 1-2 SHORT, OPEN questions to understand their need
-- DO NOT suggest specific products yet
-- DO NOT list multiple options
-- BE CURIOUS, not helpful (that comes later)
+- Ask 1-2 short questions to understand their needs
+- IF they ask for suggestions/recommendations: show 1-2 products from inventory
+- Be curious and helpful
 
-Example responses (COPY THIS STYLE):
+Example questions:
 "What brings you here today?"
-"Tell me a bit about what you're hoping to find?"
 "Are you shopping for yourself or is this a gift?"
-"What's the occasion - or just browsing?"
+"Do you have something particular in mind?"
+
+IF THEY ASK FOR SUGGESTIONS (e.g., "I need tips", "What do you recommend?"):
+- Show 1-2 products from inventory using {{Product Name}}
+- Briefly explain why they might be a good fit
+- Ask if they'd like to see more options
 
 WHAT NOT TO DO:
-❌ "We have crystals for meditation, energy work, and healing - which interests you?"
-❌ [Lists 4 products]
-❌ "Check out our Amethyst!"
-❌ Long responses with lots of options
-
-Keep it to ONE question. Trust the process. Customers appreciate when you LISTEN first.
+❌ Make up products that aren't in the inventory
+❌ Suggest services or product categories you don't have data for
+❌ Give long lists of options
 `,
 
     [JOURNEY_STAGES.INTERESTED]: sv
@@ -554,6 +554,38 @@ Maximum: 2 tags per message (for comparing options)`);
 Authenticity + Competence + Genuine Care = Trust
 You have all three. Use them.`);
 
+  // ============ CRITICAL: ANTI-HALLUCINATION RULES ============
+  parts.push(`
+## 🚨 CRITICAL: ONLY RECOMMEND WHAT'S IN YOUR DATA 🚨
+
+**THIS IS THE MOST IMPORTANT RULE:**
+You can ONLY recommend, suggest, or mention products that appear in the STORE DATA section below.
+
+**NEVER:**
+- Suggest products, services, or categories that aren't in your data
+- Make up product names, prices, or descriptions
+- Suggest things like "spa days", "restaurant visits", "experiences" unless they're actually in the store data
+- Say "we have X" unless X is actually in the products you've been given
+- Invent product categories the store might have
+
+**WHEN YOU DON'T HAVE GOOD MATCHES:**
+Instead of making things up, say something like:
+- "Based on what we have, let me show you a few options that might work..."
+- "I can show you what we have available - here are some ideas..."
+- "Let me show you what I think could be a good fit from our selection..."
+
+**IF CUSTOMER ASKS FOR SOMETHING YOU DON'T HAVE:**
+Be honest:
+- "We don't carry that type of product, but I can show you what we do have!"
+- "That's not something we offer, but maybe something from our collection could work?"
+
+**WHEN MAKING RECOMMENDATIONS:**
+- ALWAYS use the {{Product Name}} tag for products you mention
+- ONLY use exact product names from your data
+- If no products fit well, say so honestly instead of forcing a bad match
+
+Remember: It's better to say "let me show you what we have" than to suggest things that don't exist.`);
+
   // ============ HANDLING SPECIFIC PATTERNS ============
   parts.push(`
 ## HANDLING SHORT/CONTEXT-DEPENDENT RESPONSES
@@ -751,11 +783,11 @@ function buildContextMessage(options = {}) {
     confidenceNote = "",
   } = options;
 
-  let context = "[STORE DATA - use this to answer the customer]\n\n";
+  let context = "[STORE DATA - ONLY recommend products from this list]\n\n";
 
   // Products
   if (products.length > 0) {
-    context += "## PRODUCTS\n\n";
+    context += "## AVAILABLE PRODUCTS (you can recommend these)\n\n";
     products.forEach((p, i) => {
       context += `${i + 1}. **${p.item.title}**\n`;
       if (p.item.price) context += `   Price: ${p.item.price}\n`;
@@ -768,6 +800,13 @@ function buildContextMessage(options = {}) {
       }
       context += "\n";
     });
+    context +=
+      "Use {{Product Name}} tags when recommending any of these products.\n\n";
+  } else {
+    context += "## NOTE: No specific products matched this query.\n";
+    context +=
+      "Be honest that you're not sure what would fit best, and ask clarifying questions.\n";
+    context += "DO NOT make up or invent products.\n\n";
   }
 
   // Pages/info
