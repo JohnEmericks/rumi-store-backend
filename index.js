@@ -25,6 +25,7 @@ const {
   processEndedConversations,
   extractInsightsFromConversation,
 } = require("./services/insight-extractor");
+const { cleanupOldMemories } = require("./services/customer-memory");
 
 // Initialize Express app
 const app = express();
@@ -77,6 +78,10 @@ setInterval(processEndedConversations, 2 * 60 * 1000);
 
 // Run once on startup (after a short delay)
 setTimeout(processEndedConversations, 30 * 1000);
+
+// Cleanup old customer memories once per day (at startup + every 24 hours)
+setTimeout(cleanupOldMemories, 60 * 1000); // 1 minute after startup
+setInterval(cleanupOldMemories, 24 * 60 * 60 * 1000); // Daily
 
 // =============================================================================
 // START SERVER

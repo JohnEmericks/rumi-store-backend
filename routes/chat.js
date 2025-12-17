@@ -44,6 +44,25 @@ const {
   incrementConversation,
   incrementMessage,
 } = require("../services/license");
+const {
+  hybridClassifyIntent,
+  extractSignalsFromLLMResult,
+} = require("../services/llm-intent-classifier");
+const {
+  evaluateHandoffNeed,
+  getHandoffMessage,
+  getSoftHandoffSuggestion,
+  createHandoffTracker,
+  restoreTracker,
+  serializeTracker,
+} = require("../services/handoff");
+const {
+  getCustomerId,
+  loadCustomerMemories,
+  formatMemoriesForPrompt,
+  extractRealTimeMemories,
+  saveRealTimeMemories,
+} = require("../services/customer-memory");
 
 /**
  * Load store data from database
@@ -506,10 +525,50 @@ router.post("/chat", async (req, res) => {
   // Determine language
   const userLanguage = determineLanguage(language, storeData.personality);
 
-  // ============ INTENT CLASSIFICATION ============
+  // ============ GET STORE DB ID EARLY (needed for memory) ============
+  const storeDbId = await getStoreDbId(store_id);
+
+  // ============ CUSTOMER MEMORY - Load returning customer context ============
+  let customerId = null;
+  let customerMemories = [];
+  let customerMemoryPrompt = null;
+
+  if (storeDbId && session_id) {
+    // Get customer identifier (can be enhanced with fingerprinting/email)
+    customerId = getCustomerId(session_id);
+
+    // Load memories for returning customers
+    customerMemories = await loadCustomerMemories(storeDbId, customerId, 8);
+
+    if (customerMemories.length > 0) {
+      customerMemoryPrompt = formatMemoriesForPrompt(
+        customerMemories,
+        userLanguage
+      );
+      console.log(
+        `[Memory] Loaded ${customerMemories.length} memories for customer ${customerId}`
+      );
+    }
+  }
+
+  // ============ INTENT CLASSIFICATION (Hybrid: Regex + LLM fallback) ============
   // Build preliminary conversation state for intent classification
   const preliminaryState = buildConversationState(history, message, {});
-  const currentIntent = classifyIntent(message, preliminaryState);
+
+  // Get last assistant message for context
+  const lastAssistantMessage =
+    history.filter((h) => h.role === "assistant").pop()?.content || "";
+
+  // Use hybrid classifier (regex with LLM fallback)
+  const currentIntent = await hybridClassifyIntent(
+    message,
+    preliminaryState,
+    classifyIntent,
+    lastAssistantMessage
+  );
+
+  // Extract additional signals from LLM classification
+  const llmSignals = extractSignalsFromLLMResult(currentIntent);
 
   // Now build full state with intent
   const conversationState = buildConversationState(
@@ -517,26 +576,49 @@ router.post("/chat", async (req, res) => {
     message,
     currentIntent
   );
+
+  // Enrich conversation state with LLM signals
+  if (llmSignals.sentiment) {
+    conversationState.currentSentiment = llmSignals.sentiment;
+  }
+  if (llmSignals.priceObjection) {
+    conversationState.priceObjection = true;
+  }
+  if (llmSignals.urgency) {
+    conversationState.urgency = llmSignals.urgency;
+  }
+
   const followUpContext = getFollowUpContext(conversationState, currentIntent);
 
   console.log(
-    `[Chat] Intent: ${currentIntent.primary} (confidence: ${currentIntent.confidence}), Stage: ${conversationState.journeyStage}, Turn: ${conversationState.turnCount}`
+    `[Chat] Intent: ${currentIntent.primary} (confidence: ${
+      currentIntent.confidence
+    }, source: ${currentIntent.source || "regex"}), Stage: ${
+      conversationState.journeyStage
+    }, Turn: ${conversationState.turnCount}`
   );
   if (followUpContext.hasContext) {
     console.log(`[Chat] Follow-up context:`, followUpContext.explanation);
   }
 
+  // ============ HANDOFF TRACKING ============
+  let handoffTracker = createHandoffTracker();
+
   // Track conversation
-  const storeDbId = await getStoreDbId(store_id);
   let conversation = null;
   let isNewConversation = false;
 
   if (storeDbId && session_id) {
     const existingConv = await pool.query(
-      `SELECT id FROM conversations WHERE store_id = $1 AND session_id = $2`,
+      `SELECT id, handoff_tracker FROM conversations WHERE store_id = $1 AND session_id = $2`,
       [storeDbId, session_id]
     );
     isNewConversation = existingConv.rowCount === 0;
+
+    // Restore handoff tracker state if conversation exists
+    if (!isNewConversation && existingConv.rows[0]?.handoff_tracker) {
+      handoffTracker = restoreTracker(existingConv.rows[0].handoff_tracker);
+    }
 
     conversation = await getOrCreateConversation(
       storeDbId,
@@ -555,6 +637,106 @@ router.post("/chat", async (req, res) => {
 
   if (storeData.licenseKeyId) {
     await incrementMessage(storeData.licenseKeyId);
+  }
+
+  // ============ SAVE CUSTOMER ID TO CONVERSATION ============
+  if (conversation && customerId) {
+    await pool.query(
+      `UPDATE conversations SET customer_id = $1 WHERE id = $2`,
+      [customerId, conversation.id]
+    );
+  }
+
+  // ============ EXTRACT AND SAVE REAL-TIME MEMORIES ============
+  if (storeDbId && customerId) {
+    const realTimeMemories = extractRealTimeMemories(
+      message,
+      conversationState
+    );
+    if (realTimeMemories.length > 0) {
+      await saveRealTimeMemories(
+        storeDbId,
+        customerId,
+        realTimeMemories,
+        conversation?.id
+      );
+      console.log(
+        `[Memory] Saved ${realTimeMemories.length} real-time memories`
+      );
+    }
+  }
+
+  // ============ HANDOFF EVALUATION ============
+  // Record intent confidence for handoff tracking
+  handoffTracker.recordConfidence(currentIntent.confidence);
+
+  // Record sentiment if available
+  if (currentIntent.sentiment) {
+    handoffTracker.recordSentiment(currentIntent.sentiment);
+  } else if (llmSignals.sentiment) {
+    handoffTracker.recordSentiment(llmSignals.sentiment);
+  }
+
+  // Evaluate if handoff is needed
+  const handoffEval = evaluateHandoffNeed(
+    message,
+    conversationState,
+    currentIntent,
+    handoffTracker
+  );
+
+  // If handoff is triggered, return handoff response
+  if (handoffEval.needed) {
+    console.log(
+      `[Handoff] Triggered: ${handoffEval.reason} - ${handoffEval.message}`
+    );
+
+    const handoffResponse = getHandoffMessage(
+      handoffEval.reason,
+      userLanguage,
+      storeFacts
+    );
+
+    // Save handoff state
+    if (conversation) {
+      await saveConversationMessage(
+        conversation.id,
+        "assistant",
+        handoffResponse,
+        []
+      );
+      await pool.query(
+        `UPDATE conversations 
+         SET handoff_triggered = true, 
+             handoff_reason = $1,
+             handoff_tracker = $2
+         WHERE id = $3`,
+        [
+          handoffEval.reason,
+          JSON.stringify(serializeTracker(handoffTracker)),
+          conversation.id,
+        ]
+      );
+    }
+
+    return res.json({
+      ok: true,
+      store_id,
+      answer: handoffResponse,
+      product_cards: [],
+      handoff: {
+        triggered: true,
+        reason: handoffEval.reason,
+        message: handoffEval.message,
+      },
+      debug: {
+        intent: currentIntent.primary,
+        intent_confidence: currentIntent.confidence,
+        intent_source: currentIntent.source || "regex",
+        journey_stage: conversationState.journeyStage,
+        handoff_reason: handoffEval.reason,
+      },
+    });
   }
 
   // ============ QUICK RESPONSES FOR TERMINAL INTENTS ============
@@ -646,10 +828,10 @@ router.post("/chat", async (req, res) => {
           `[RAG] Info intent - retrieved ${relevantPages.length} pages, 0 products`
         );
       } else {
-        // Normal product retrieval
+        // Normal product retrieval - RAISED THRESHOLD from 0.35 to 0.45
         relevantProducts = scoredProducts
           .slice(0, 8)
-          .filter((s) => s.score >= 0.35);
+          .filter((s) => s.score >= 0.45);
         relevantPages = scoredPages.slice(0, 2).filter((s) => s.score >= 0.3);
         bestProductScore = scoredProducts[0]?.score || 0;
         console.log(
@@ -665,7 +847,7 @@ router.post("/chat", async (req, res) => {
     }
 
     // ============ BUILD CONTEXT & SYSTEM PROMPT ============
-    const systemPrompt = buildSystemPrompt({
+    let systemPrompt = buildSystemPrompt({
       storeName: storeData.storeName || "this store",
       personality: storeData.personality,
       language: userLanguage,
@@ -674,6 +856,19 @@ router.post("/chat", async (req, res) => {
       hasProductContext: relevantProducts.length > 0,
       hasContactInfo: storeFacts.length > 0,
     });
+
+    // ============ INJECT CUSTOMER MEMORY INTO SYSTEM PROMPT ============
+    if (customerMemoryPrompt) {
+      systemPrompt = systemPrompt + "\n\n" + customerMemoryPrompt;
+    }
+
+    // Add soft handoff suggestion if recommended but not required
+    if (handoffEval.suggestHandoff && !handoffEval.needed) {
+      const softSuggestion = getSoftHandoffSuggestion(userLanguage);
+      systemPrompt =
+        systemPrompt +
+        `\n\n**Note:** Customer may benefit from human assistance. Consider naturally offering: "${softSuggestion}"`;
+    }
 
     const messages = [{ role: "system", content: systemPrompt }];
 
@@ -869,6 +1064,15 @@ router.post("/chat", async (req, res) => {
         answer,
         productsShown
       );
+
+      // Record uncertain response for handoff tracking
+      handoffTracker.recordUncertainResponse(answer);
+
+      // Save handoff tracker state
+      await pool.query(
+        `UPDATE conversations SET handoff_tracker = $1 WHERE id = $2`,
+        [JSON.stringify(serializeTracker(handoffTracker)), conversation.id]
+      );
     }
 
     return res.json({
@@ -876,9 +1080,11 @@ router.post("/chat", async (req, res) => {
       store_id,
       answer,
       product_cards: productCards,
+      returning_customer: customerMemories.length > 0,
       debug: {
         intent: currentIntent.primary,
         intent_confidence: currentIntent.confidence,
+        intent_source: currentIntent.source || "regex",
         intent_description: describeIntent(currentIntent.primary),
         journey_stage: conversationState.journeyStage,
         context_summary: conversationState.contextSummary,
@@ -892,6 +1098,9 @@ router.post("/chat", async (req, res) => {
         products_matched: productCards.length,
         best_score: bestProductScore.toFixed(3),
         max_tokens: maxTokens,
+        customer_memories: customerMemories.length,
+        handoff_risk: handoffTracker.getRiskLevel(),
+        sentiment: currentIntent.sentiment || llmSignals.sentiment || null,
         top_products: relevantProducts.slice(0, 3).map((e) => ({
           title: e.item.title,
           score: e.score.toFixed(3),
@@ -971,6 +1180,126 @@ router.post("/end-conversation", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, error: "Failed to end conversation" });
+  }
+});
+
+/**
+ * Clear customer memory endpoint (GDPR compliance)
+ */
+router.post("/clear-memory", async (req, res) => {
+  const { store_id, session_id } = req.body || {};
+
+  if (!store_id || !session_id) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and session_id are required" });
+  }
+
+  try {
+    const storeDbId = await getStoreDbId(store_id);
+    if (!storeDbId) {
+      return res.status(404).json({ ok: false, error: "Store not found" });
+    }
+
+    const {
+      clearCustomerMemory,
+      getCustomerId,
+    } = require("../services/customer-memory");
+    const customerId = getCustomerId(session_id);
+
+    const result = await clearCustomerMemory(storeDbId, customerId);
+
+    if (result.success) {
+      console.log(
+        `Cleared ${result.deleted} memories for customer ${customerId}`
+      );
+      return res.json({
+        ok: true,
+        deleted: result.deleted,
+        message: "Your conversation history has been cleared.",
+      });
+    } else {
+      return res.status(500).json({ ok: false, error: result.error });
+    }
+  } catch (err) {
+    console.error("Error in /clear-memory:", err);
+    return res.status(500).json({ ok: false, error: "Failed to clear memory" });
+  }
+});
+
+/**
+ * Get customer memory summary (transparency)
+ */
+router.get("/my-memory", async (req, res) => {
+  const { store_id, session_id } = req.query || {};
+
+  if (!store_id || !session_id) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "store_id and session_id are required" });
+  }
+
+  try {
+    const storeDbId = await getStoreDbId(store_id);
+    if (!storeDbId) {
+      return res.status(404).json({ ok: false, error: "Store not found" });
+    }
+
+    const {
+      loadCustomerMemories,
+      getCustomerId,
+    } = require("../services/customer-memory");
+    const customerId = getCustomerId(session_id);
+
+    const memories = await loadCustomerMemories(storeDbId, customerId, 20);
+
+    // Group by type for readability
+    const grouped = {
+      interests: [],
+      preferences: [],
+      constraints: [],
+      context: [],
+    };
+
+    memories.forEach((m) => {
+      const item = {
+        value: m.value,
+        key: m.key,
+        last_seen: m.last_seen,
+        mention_count: m.mention_count,
+      };
+
+      switch (m.memory_type) {
+        case "interest":
+          grouped.interests.push(item);
+          break;
+        case "preference":
+          grouped.preferences.push(item);
+          break;
+        case "constraint":
+          grouped.constraints.push(item);
+          break;
+        case "purchase_context":
+          grouped.context.push(item);
+          break;
+      }
+    });
+
+    return res.json({
+      ok: true,
+      customer_id: customerId,
+      memory_count: memories.length,
+      memories: grouped,
+      message:
+        memories.length > 0
+          ? "Here's what I remember about your preferences."
+          : "I don't have any saved preferences for you yet.",
+    });
+  } catch (err) {
+    console.error("Error in /my-memory:", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "Failed to retrieve memory" });
   }
 });
 

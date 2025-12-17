@@ -6,12 +6,20 @@
 
 const { pool } = require("../config/database");
 const { openai } = require("./embedding");
+const { extractMemoriesFromConversation } = require("./customer-memory");
 
 /**
  * Extract insights from a completed conversation using AI
  */
 async function extractInsightsFromConversation(conversationId, storeDbId) {
   try {
+    // Get conversation with customer_id
+    const convResult = await pool.query(
+      `SELECT customer_id FROM conversations WHERE id = $1`,
+      [conversationId]
+    );
+    const customerId = convResult.rows[0]?.customer_id;
+
     // Get all messages from the conversation
     const messagesResult = await pool.query(
       `SELECT role, content, products_shown, created_at 
@@ -26,6 +34,23 @@ async function extractInsightsFromConversation(conversationId, storeDbId) {
         `Conversation ${conversationId}: Too few messages for insight extraction`
       );
       return;
+    }
+
+    // ============ EXTRACT CUSTOMER MEMORIES (Phase 1 addition) ============
+    if (customerId) {
+      try {
+        const memories = await extractMemoriesFromConversation(
+          conversationId,
+          storeDbId,
+          customerId
+        );
+        console.log(
+          `Conversation ${conversationId}: Extracted ${memories.length} customer memories`
+        );
+      } catch (memErr) {
+        console.error(`Error extracting customer memories:`, memErr);
+        // Continue with insight extraction even if memory fails
+      }
     }
 
     // Format conversation for the AI
