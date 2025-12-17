@@ -56,13 +56,6 @@ const {
   restoreTracker,
   serializeTracker,
 } = require("../services/handoff");
-const {
-  getCustomerId,
-  loadCustomerMemories,
-  formatMemoriesForPrompt,
-  extractRealTimeMemories,
-  saveRealTimeMemories,
-} = require("../services/customer-memory");
 
 /**
  * Load store data from database
@@ -519,31 +512,8 @@ router.post("/chat", async (req, res) => {
   // Determine language
   const userLanguage = determineLanguage(language, storeData.personality);
 
-  // ============ GET STORE DB ID EARLY (needed for memory) ============
+  // ============ GET STORE DB ID ============
   const storeDbId = await getStoreDbId(store_id);
-
-  // ============ CUSTOMER MEMORY - Load returning customer context ============
-  let customerId = null;
-  let customerMemories = [];
-  let customerMemoryPrompt = null;
-
-  if (storeDbId && session_id) {
-    // Get customer identifier (can be enhanced with fingerprinting/email)
-    customerId = getCustomerId(session_id);
-
-    // Load memories for returning customers
-    customerMemories = await loadCustomerMemories(storeDbId, customerId, 8);
-
-    if (customerMemories.length > 0) {
-      customerMemoryPrompt = formatMemoriesForPrompt(
-        customerMemories,
-        userLanguage
-      );
-      console.log(
-        `[Memory] Loaded ${customerMemories.length} memories for customer ${customerId}`
-      );
-    }
-  }
 
   // ============ INTENT CLASSIFICATION (Hybrid: Regex + LLM fallback) ============
   // Build preliminary conversation state for intent classification
@@ -631,33 +601,6 @@ router.post("/chat", async (req, res) => {
 
   if (storeData.licenseKeyId) {
     await incrementMessage(storeData.licenseKeyId);
-  }
-
-  // ============ SAVE CUSTOMER ID TO CONVERSATION ============
-  if (conversation && customerId) {
-    await pool.query(
-      `UPDATE conversations SET customer_id = $1 WHERE id = $2`,
-      [customerId, conversation.id]
-    );
-  }
-
-  // ============ EXTRACT AND SAVE REAL-TIME MEMORIES ============
-  if (storeDbId && customerId) {
-    const realTimeMemories = extractRealTimeMemories(
-      message,
-      conversationState
-    );
-    if (realTimeMemories.length > 0) {
-      await saveRealTimeMemories(
-        storeDbId,
-        customerId,
-        realTimeMemories,
-        conversation?.id
-      );
-      console.log(
-        `[Memory] Saved ${realTimeMemories.length} real-time memories`
-      );
-    }
   }
 
   // ============ HANDOFF EVALUATION ============
@@ -850,11 +793,6 @@ router.post("/chat", async (req, res) => {
       hasProductContext: relevantProducts.length > 0,
       hasContactInfo: storeFacts.length > 0,
     });
-
-    // ============ INJECT CUSTOMER MEMORY INTO SYSTEM PROMPT ============
-    if (customerMemoryPrompt) {
-      systemPrompt = systemPrompt + "\n\n" + customerMemoryPrompt;
-    }
 
     // Add soft handoff suggestion if recommended but not required
     if (handoffEval.suggestHandoff && !handoffEval.needed) {
@@ -1074,7 +1012,6 @@ router.post("/chat", async (req, res) => {
       store_id,
       answer,
       product_cards: productCards,
-      returning_customer: customerMemories.length > 0,
       debug: {
         intent: currentIntent.primary,
         intent_confidence: currentIntent.confidence,
@@ -1092,7 +1029,6 @@ router.post("/chat", async (req, res) => {
         products_matched: productCards.length,
         best_score: bestProductScore.toFixed(3),
         max_tokens: maxTokens,
-        customer_memories: customerMemories.length,
         handoff_risk: handoffTracker.getRiskLevel(),
         sentiment: currentIntent.sentiment || llmSignals.sentiment || null,
         top_products: relevantProducts.slice(0, 3).map((e) => ({
@@ -1174,126 +1110,6 @@ router.post("/end-conversation", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, error: "Failed to end conversation" });
-  }
-});
-
-/**
- * Clear customer memory endpoint (GDPR compliance)
- */
-router.post("/clear-memory", async (req, res) => {
-  const { store_id, session_id } = req.body || {};
-
-  if (!store_id || !session_id) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "store_id and session_id are required" });
-  }
-
-  try {
-    const storeDbId = await getStoreDbId(store_id);
-    if (!storeDbId) {
-      return res.status(404).json({ ok: false, error: "Store not found" });
-    }
-
-    const {
-      clearCustomerMemory,
-      getCustomerId,
-    } = require("../services/customer-memory");
-    const customerId = getCustomerId(session_id);
-
-    const result = await clearCustomerMemory(storeDbId, customerId);
-
-    if (result.success) {
-      console.log(
-        `Cleared ${result.deleted} memories for customer ${customerId}`
-      );
-      return res.json({
-        ok: true,
-        deleted: result.deleted,
-        message: "Your conversation history has been cleared.",
-      });
-    } else {
-      return res.status(500).json({ ok: false, error: result.error });
-    }
-  } catch (err) {
-    console.error("Error in /clear-memory:", err);
-    return res.status(500).json({ ok: false, error: "Failed to clear memory" });
-  }
-});
-
-/**
- * Get customer memory summary (transparency)
- */
-router.get("/my-memory", async (req, res) => {
-  const { store_id, session_id } = req.query || {};
-
-  if (!store_id || !session_id) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "store_id and session_id are required" });
-  }
-
-  try {
-    const storeDbId = await getStoreDbId(store_id);
-    if (!storeDbId) {
-      return res.status(404).json({ ok: false, error: "Store not found" });
-    }
-
-    const {
-      loadCustomerMemories,
-      getCustomerId,
-    } = require("../services/customer-memory");
-    const customerId = getCustomerId(session_id);
-
-    const memories = await loadCustomerMemories(storeDbId, customerId, 20);
-
-    // Group by type for readability
-    const grouped = {
-      interests: [],
-      preferences: [],
-      constraints: [],
-      context: [],
-    };
-
-    memories.forEach((m) => {
-      const item = {
-        value: m.value,
-        key: m.key,
-        last_seen: m.last_seen,
-        mention_count: m.mention_count,
-      };
-
-      switch (m.memory_type) {
-        case "interest":
-          grouped.interests.push(item);
-          break;
-        case "preference":
-          grouped.preferences.push(item);
-          break;
-        case "constraint":
-          grouped.constraints.push(item);
-          break;
-        case "purchase_context":
-          grouped.context.push(item);
-          break;
-      }
-    });
-
-    return res.json({
-      ok: true,
-      customer_id: customerId,
-      memory_count: memories.length,
-      memories: grouped,
-      message:
-        memories.length > 0
-          ? "Here's what I remember about your preferences."
-          : "I don't have any saved preferences for you yet.",
-    });
-  } catch (err) {
-    console.error("Error in /my-memory:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Failed to retrieve memory" });
   }
 });
 

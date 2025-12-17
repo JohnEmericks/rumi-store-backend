@@ -1,254 +1,483 @@
 /**
- * Insight Extractor Service
+ * Human Handoff Service
  *
- * Extracts insights from completed conversations using AI.
+ * Detects when a conversation should be handed off to a human agent
+ * and provides appropriate responses and metadata.
+ *
+ * Triggers:
+ * - Customer explicitly asks for human
+ * - Multiple low-confidence responses
+ * - Detected frustration/negative sentiment
+ * - Off-topic or complaint situations
+ * - Repeated "I don't know" responses
  */
 
-const { pool } = require("../config/database");
-const { openai } = require("./embedding");
-const { extractMemoriesFromConversation } = require("./customer-memory");
+const { INTENTS } = require("./intent-classifier");
 
 /**
- * Extract insights from a completed conversation using AI
+ * Handoff reasons
  */
-async function extractInsightsFromConversation(conversationId, storeDbId) {
-  try {
-    // Get conversation with customer_id
-    const convResult = await pool.query(
-      `SELECT customer_id FROM conversations WHERE id = $1`,
-      [conversationId]
-    );
-    const customerId = convResult.rows[0]?.customer_id;
+const HANDOFF_REASONS = {
+  CUSTOMER_REQUEST: "customer_request",
+  LOW_CONFIDENCE: "low_confidence",
+  FRUSTRATION: "frustration",
+  OFF_TOPIC: "off_topic",
+  COMPLAINT: "complaint",
+  REPEATED_FAILURE: "repeated_failure",
+  COMPLEX_QUERY: "complex_query",
+  ACCOUNT_ISSUE: "account_issue",
+  URGENT: "urgent",
+};
 
-    // Get all messages from the conversation
-    const messagesResult = await pool.query(
-      `SELECT role, content, products_shown, created_at 
-       FROM conv_messages 
-       WHERE conversation_id = $1 
-       ORDER BY created_at ASC`,
-      [conversationId]
-    );
-
-    if (messagesResult.rowCount < 2) {
-      console.log(
-        `Conversation ${conversationId}: Too few messages for insight extraction`
-      );
-      return;
-    }
-
-    // ============ EXTRACT CUSTOMER MEMORIES (Phase 1 addition) ============
-    if (customerId) {
-      try {
-        const memories = await extractMemoriesFromConversation(
-          conversationId,
-          storeDbId,
-          customerId
-        );
-        console.log(
-          `Conversation ${conversationId}: Extracted ${memories.length} customer memories`
-        );
-      } catch (memErr) {
-        console.error(`Error extracting customer memories:`, memErr);
-        // Continue with insight extraction even if memory fails
-      }
-    }
-
-    // Format conversation for the AI
-    const conversationText = messagesResult.rows
-      .map(
-        (m) => `${m.role === "user" ? "Customer" : "Assistant"}: ${m.content}`
-      )
-      .join("\n\n");
-
-    // Get store's product list for context
-    const productsResult = await pool.query(
-      `SELECT title FROM store_items WHERE store_id = $1 AND type = 'product' LIMIT 100`,
-      [storeDbId]
-    );
-    const productNames = productsResult.rows.map((r) => r.title).join(", ");
-
-    const extractionPrompt = `Analyze this customer service conversation and extract structured insights.
-
-CONVERSATION:
-${conversationText}
-
-STORE'S PRODUCTS (for reference):
-${productNames || "No product list available"}
-
-Extract the following insights in JSON format:
-
-{
-  "product_interests": [
-    // Products the customer showed interest in or asked about
-    // Include both specific products AND general product categories/types
+/**
+ * Patterns that indicate customer wants to talk to a human
+ */
+const HUMAN_REQUEST_PATTERNS = {
+  sv: [
+    /prata med (en )?(människa|person|någon|agent|support)/i,
+    /kan jag (få )?(prata|tala|snacka) med/i,
+    /finns det (någon|en) (människa|person)/i,
+    /riktig person/i,
+    /human support/i,
+    /kontakta (er|dig|support|kundtjänst)/i,
+    /ring(a)? (mig|er)/i,
+    /nå (en|någon) (person|människa)/i,
   ],
-  "topics": [
-    // Main topics discussed (not products)
-    // Example: ["shipping", "returns", "gift recommendations", "pricing"]
+  en: [
+    /talk to (a )?(human|person|someone|agent|representative)/i,
+    /speak (to|with) (a )?(human|person|someone|real)/i,
+    /can i (get|have|speak|talk)/i,
+    /real person/i,
+    /human (support|agent|help)/i,
+    /contact (support|someone|you)/i,
+    /call (me|you)/i,
+    /reach (a |an )?(person|human|agent)/i,
+    /customer service/i,
+    /live (chat|agent|support)/i,
   ],
-  "sentiment": "positive" | "neutral" | "frustrated",
-  // Overall customer sentiment based on their messages
-  
-  "unresolved": [
-    // Questions or requests the assistant couldn't fully answer
-  ]
-}
+};
 
-Rules:
-- Only include product_interests if the customer actually showed interest
-- Topics should be general themes, not specific products
-- Be conservative with "frustrated" sentiment - only use if clearly negative
-- Return ONLY valid JSON, no markdown or explanation
+/**
+ * Patterns indicating frustration or complaint
+ */
+const FRUSTRATION_PATTERNS = {
+  sv: [
+    /fungerar inte/i,
+    /förstår (du )?(inte|ingenting)/i,
+    /hjälper (inte|mig inte)/i,
+    /värdelös/i,
+    /dålig/i,
+    /irriterad/i,
+    /frustrerad/i,
+    /arg\b/i,
+    /trött på/i,
+    /ge upp/i,
+    /meningslös/i,
+    /hopplös/i,
+  ],
+  en: [
+    /not (working|helping)/i,
+    /(don't|doesn't) understand/i,
+    /useless/i,
+    /terrible/i,
+    /frustrated/i,
+    /annoyed/i,
+    /angry/i,
+    /giving up/i,
+    /waste of time/i,
+    /hopeless/i,
+    /this is ridiculous/i,
+    /what('s| is) wrong with/i,
+  ],
+};
 
-JSON:`;
+/**
+ * Patterns indicating off-topic or account issues
+ */
+const OFF_TOPIC_PATTERNS = {
+  sv: [
+    /min (beställning|order)/i,
+    /var är (mitt|min|mina) (paket|order)/i,
+    /leverans(problem|status)/i,
+    /reklamation/i,
+    /klagomål/i,
+    /återbetalning/i,
+    /pengarna tillbaka/i,
+    /trasig|skadad|defekt/i,
+    /fel (produkt|vara)/i,
+  ],
+  en: [
+    /my (order|package|delivery)/i,
+    /where is my/i,
+    /delivery (problem|status|issue)/i,
+    /complaint/i,
+    /refund/i,
+    /money back/i,
+    /broken|damaged|defective/i,
+    /wrong (product|item)/i,
+    /cancel (my |the )?order/i,
+    /tracking (number|info)/i,
+  ],
+};
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an expert at analyzing customer conversations and extracting actionable insights. Always respond with valid JSON only.",
-        },
-        { role: "user", content: extractionPrompt },
-      ],
-      temperature: 0.3,
-      max_tokens: 500,
-    });
+/**
+ * Track conversation state for handoff decisions
+ */
+class HandoffTracker {
+  constructor() {
+    this.lowConfidenceCount = 0;
+    this.uncertainResponseCount = 0;
+    this.negativeSentimentCount = 0;
+    this.sentimentHistory = [];
+  }
 
-    const responseText = completion.choices[0]?.message?.content || "{}";
+  /**
+   * Record a response confidence level
+   */
+  recordConfidence(confidence) {
+    if (confidence < 7) {
+      this.lowConfidenceCount++;
+    } else {
+      // Reset on good confidence
+      this.lowConfidenceCount = Math.max(0, this.lowConfidenceCount - 1);
+    }
+  }
 
-    // Parse the JSON response
-    let insights;
-    try {
-      const cleanJson = responseText
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-      insights = JSON.parse(cleanJson);
-    } catch (parseErr) {
-      console.error(
-        `Conversation ${conversationId}: Failed to parse insights JSON:`,
-        responseText
-      );
-      return;
+  /**
+   * Record if AI gave an uncertain response
+   */
+  recordUncertainResponse(responseText) {
+    const uncertainPhrases = [
+      /jag (vet inte|är inte säker|kan inte)/i,
+      /i (don't know|'m not sure|can't|cannot)/i,
+      /tyvärr (kan jag inte|vet jag inte)/i,
+      /unfortunately/i,
+      /outside (what i|my)/i,
+      /utanför (vad jag|mitt)/i,
+    ];
+
+    if (uncertainPhrases.some((p) => p.test(responseText))) {
+      this.uncertainResponseCount++;
+    }
+  }
+
+  /**
+   * Record sentiment
+   */
+  recordSentiment(sentiment) {
+    this.sentimentHistory.push(sentiment);
+    if (this.sentimentHistory.length > 5) {
+      this.sentimentHistory.shift();
     }
 
-    // Store extracted insights
-    const insightsToStore = [];
-
-    // Product interests (priority 1)
-    if (Array.isArray(insights.product_interests)) {
-      for (const product of insights.product_interests) {
-        if (product && typeof product === "string") {
-          insightsToStore.push({
-            type: "product_interest",
-            value: product.trim(),
-            confidence: 0.9,
-          });
-        }
-      }
+    if (sentiment === "negative" || sentiment === "frustrated") {
+      this.negativeSentimentCount++;
     }
+  }
 
-    // Topics (priority 2)
-    if (Array.isArray(insights.topics)) {
-      for (const topic of insights.topics) {
-        if (topic && typeof topic === "string") {
-          insightsToStore.push({
-            type: "topic",
-            value: topic.trim().toLowerCase(),
-            confidence: 0.85,
-          });
-        }
-      }
-    }
+  /**
+   * Check if sentiment is declining
+   */
+  isSentimentDeclining() {
+    if (this.sentimentHistory.length < 3) return false;
 
-    // Sentiment (priority 3)
-    if (
-      insights.sentiment &&
-      ["positive", "neutral", "frustrated"].includes(insights.sentiment)
-    ) {
-      insightsToStore.push({
-        type: "sentiment",
-        value: insights.sentiment,
-        confidence: 0.8,
-      });
-    }
+    const sentimentScores = {
+      positive: 3,
+      neutral: 2,
+      negative: 1,
+      frustrated: 0,
+    };
 
-    // Unresolved questions (priority 4)
-    if (Array.isArray(insights.unresolved)) {
-      for (const question of insights.unresolved) {
-        if (question && typeof question === "string") {
-          insightsToStore.push({
-            type: "unresolved",
-            value: question.trim(),
-            confidence: 0.75,
-          });
-        }
-      }
-    }
+    const scores = this.sentimentHistory.map((s) => sentimentScores[s] || 2);
+    const recent = scores.slice(-3);
 
-    // Insert all insights
-    for (const insight of insightsToStore) {
-      await pool.query(
-        `INSERT INTO conv_insights (conversation_id, store_id, insight_type, value, confidence)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          conversationId,
-          storeDbId,
-          insight.type,
-          insight.value,
-          insight.confidence,
-        ]
-      );
-    }
+    // Check if trending downward
+    return recent[2] < recent[0] && recent[1] <= recent[0];
+  }
 
-    console.log(
-      `Conversation ${conversationId}: Extracted ${insightsToStore.length} insights`
-    );
+  /**
+   * Get current handoff risk level
+   */
+  getRiskLevel() {
+    let risk = 0;
 
-    // Mark conversation as processed
-    await pool.query(
-      `UPDATE conversations SET status = 'processed' WHERE id = $1`,
-      [conversationId]
-    );
-  } catch (err) {
-    console.error(
-      `Error extracting insights from conversation ${conversationId}:`,
-      err
-    );
+    if (this.lowConfidenceCount >= 2) risk += 2;
+    if (this.uncertainResponseCount >= 2) risk += 3;
+    if (this.negativeSentimentCount >= 2) risk += 2;
+    if (this.isSentimentDeclining()) risk += 2;
+
+    return risk;
   }
 }
 
 /**
- * Process all ended conversations that haven't been analyzed yet
+ * Check if message explicitly requests human
  */
-async function processEndedConversations() {
-  try {
-    const result = await pool.query(`
-      SELECT c.id, c.store_id 
-      FROM conversations c
-      WHERE c.status = 'ended'
-        AND c.message_count >= 2
-      ORDER BY c.ended_at ASC
-      LIMIT 10
-    `);
+function isExplicitHumanRequest(message) {
+  const allPatterns = [
+    ...HUMAN_REQUEST_PATTERNS.sv,
+    ...HUMAN_REQUEST_PATTERNS.en,
+  ];
 
-    if (result.rowCount > 0) {
-      console.log(
-        `Processing ${result.rowCount} ended conversations for insights...`
-      );
+  return allPatterns.some((pattern) => pattern.test(message));
+}
 
-      for (const row of result.rows) {
-        await extractInsightsFromConversation(row.id, row.store_id);
-      }
-    }
-  } catch (err) {
-    console.error("Error in processEndedConversations:", err);
+/**
+ * Check if message indicates frustration
+ */
+function detectFrustration(message) {
+  const allPatterns = [...FRUSTRATION_PATTERNS.sv, ...FRUSTRATION_PATTERNS.en];
+
+  return allPatterns.some((pattern) => pattern.test(message));
+}
+
+/**
+ * Check if message is off-topic (order issues, complaints, etc.)
+ */
+function isOffTopicOrAccountIssue(message) {
+  const allPatterns = [...OFF_TOPIC_PATTERNS.sv, ...OFF_TOPIC_PATTERNS.en];
+
+  return allPatterns.some((pattern) => pattern.test(message));
+}
+
+/**
+ * Evaluate whether handoff is needed
+ *
+ * @param {string} message - Current user message
+ * @param {Object} conversationState - Current conversation state
+ * @param {Object} intentResult - Intent classification result
+ * @param {HandoffTracker} tracker - Handoff tracker instance
+ * @returns {Object} Handoff evaluation result
+ */
+function evaluateHandoffNeed(
+  message,
+  conversationState,
+  intentResult,
+  tracker
+) {
+  // 1. Explicit human request - highest priority
+  if (isExplicitHumanRequest(message)) {
+    return {
+      needed: true,
+      reason: HANDOFF_REASONS.CUSTOMER_REQUEST,
+      confidence: 1.0,
+      message: "Customer explicitly requested human assistance",
+    };
   }
+
+  // 2. Off-topic or account issues
+  if (isOffTopicOrAccountIssue(message)) {
+    return {
+      needed: true,
+      reason: HANDOFF_REASONS.ACCOUNT_ISSUE,
+      confidence: 0.9,
+      message: "Customer has order/account issue requiring human help",
+    };
+  }
+
+  // 3. Strong frustration signals
+  if (detectFrustration(message)) {
+    tracker.recordSentiment("frustrated");
+
+    // Immediate handoff on strong frustration
+    if (tracker.negativeSentimentCount >= 2) {
+      return {
+        needed: true,
+        reason: HANDOFF_REASONS.FRUSTRATION,
+        confidence: 0.85,
+        message: "Multiple frustration signals detected",
+      };
+    }
+
+    // Soft handoff suggestion
+    return {
+      needed: false,
+      suggestHandoff: true,
+      reason: HANDOFF_REASONS.FRUSTRATION,
+      confidence: 0.6,
+      message: "Frustration detected - consider offering human support",
+    };
+  }
+
+  // 4. LLM-detected sentiment
+  if (
+    intentResult?.sentiment === "frustrated" ||
+    intentResult?.sentiment === "negative"
+  ) {
+    tracker.recordSentiment(intentResult.sentiment);
+  }
+
+  // 5. Repeated low confidence
+  if (tracker.lowConfidenceCount >= 3) {
+    return {
+      needed: true,
+      reason: HANDOFF_REASONS.LOW_CONFIDENCE,
+      confidence: 0.8,
+      message: "Multiple low-confidence responses",
+    };
+  }
+
+  // 6. Repeated uncertain responses
+  if (tracker.uncertainResponseCount >= 2) {
+    return {
+      needed: true,
+      reason: HANDOFF_REASONS.REPEATED_FAILURE,
+      confidence: 0.85,
+      message: "AI has been unable to help multiple times",
+    };
+  }
+
+  // 7. Declining sentiment trajectory
+  if (tracker.isSentimentDeclining() && tracker.getRiskLevel() >= 5) {
+    return {
+      needed: false,
+      suggestHandoff: true,
+      reason: HANDOFF_REASONS.FRUSTRATION,
+      confidence: 0.7,
+      message: "Customer sentiment is declining",
+    };
+  }
+
+  // 8. Off-topic intent from LLM
+  if (
+    intentResult?.primary === "off_topic" ||
+    intentResult?.reasoning?.includes("off-topic")
+  ) {
+    return {
+      needed: false,
+      suggestHandoff: true,
+      reason: HANDOFF_REASONS.OFF_TOPIC,
+      confidence: 0.6,
+      message: "Query appears to be off-topic",
+    };
+  }
+
+  // No handoff needed
+  return {
+    needed: false,
+    suggestHandoff: false,
+    reason: null,
+    confidence: 0,
+    message: null,
+  };
+}
+
+/**
+ * Get handoff response message
+ */
+function getHandoffMessage(reason, language = "Swedish", storeFacts = []) {
+  // Extract contact info from store facts
+  const email = storeFacts.find((f) => f.fact_type === "email")?.value;
+  const phone = storeFacts.find((f) => f.fact_type === "phone")?.value;
+
+  const contactInfo = [];
+  if (email)
+    contactInfo.push(
+      language === "Swedish" ? `mejla ${email}` : `email ${email}`
+    );
+  if (phone)
+    contactInfo.push(
+      language === "Swedish" ? `ring ${phone}` : `call ${phone}`
+    );
+
+  const contactString =
+    contactInfo.length > 0
+      ? contactInfo.join(language === "Swedish" ? " eller " : " or ")
+      : language === "Swedish"
+      ? "kontakta oss via hemsidan"
+      : "contact us through our website";
+
+  const messages = {
+    [HANDOFF_REASONS.CUSTOMER_REQUEST]: {
+      sv: `Självklart! Du kan ${contactString} så hjälper vårt team dig personligen. De är bäst på att hjälpa dig vidare! 😊`,
+      en: `Of course! You can ${contactString} and our team will help you personally. They're best equipped to assist you! 😊`,
+    },
+    [HANDOFF_REASONS.FRUSTRATION]: {
+      sv: `Jag förstår att det här kan vara frustrerande, och jag vill verkligen att du får rätt hjälp. Du kan ${contactString} för personlig assistans - de kan definitivt hjälpa dig bättre.`,
+      en: `I understand this can be frustrating, and I really want you to get the right help. You can ${contactString} for personal assistance - they'll definitely be able to help you better.`,
+    },
+    [HANDOFF_REASONS.LOW_CONFIDENCE]: {
+      sv: `Jag vill vara ärlig - jag är inte helt säker på att jag kan hjälpa dig med det här. För att du ska få bästa möjliga hjälp, rekommenderar jag att du ${contactString}.`,
+      en: `I want to be honest - I'm not entirely sure I can help you with this. To make sure you get the best help possible, I'd recommend you ${contactString}.`,
+    },
+    [HANDOFF_REASONS.REPEATED_FAILURE]: {
+      sv: `Det verkar som jag har svårt att hjälpa dig med det du behöver. Låt mig koppla dig till någon som kan - du kan ${contactString} så tar de hand om dig.`,
+      en: `It seems like I'm having trouble helping you with what you need. Let me connect you with someone who can - you can ${contactString} and they'll take good care of you.`,
+    },
+    [HANDOFF_REASONS.ACCOUNT_ISSUE]: {
+      sv: `För frågor om beställningar, leveranser eller ditt konto behöver du prata med vårt team direkt. Du kan ${contactString} så hjälper de dig med allt! 📦`,
+      en: `For questions about orders, deliveries, or your account, you'll need to speak with our team directly. You can ${contactString} and they'll help you with everything! 📦`,
+    },
+    [HANDOFF_REASONS.OFF_TOPIC]: {
+      sv: `Det där ligger lite utanför vad jag kan hjälpa till med, men vårt team kan säkert hjälpa dig! Du når dem via ${contactString}.`,
+      en: `That's a bit outside what I can help with, but our team can surely assist you! You can reach them at ${contactString}.`,
+    },
+    [HANDOFF_REASONS.COMPLAINT]: {
+      sv: `Jag är ledsen att du har haft problem. För att vi ska kunna lösa det här ordentligt, vänligen ${contactString} så tar vi hand om det personligen.`,
+      en: `I'm sorry you've had issues. To properly resolve this, please ${contactString} and we'll take care of it personally.`,
+    },
+  };
+
+  const reasonMessages =
+    messages[reason] || messages[HANDOFF_REASONS.CUSTOMER_REQUEST];
+  return language === "Swedish" ? reasonMessages.sv : reasonMessages.en;
+}
+
+/**
+ * Get soft handoff suggestion (offer without forcing)
+ */
+function getSoftHandoffSuggestion(language = "Swedish") {
+  const suggestions = {
+    sv: "Om du hellre vill prata med någon personligen är det också helt okej - säg bara till!",
+    en: "If you'd prefer to speak with someone personally, that's totally fine too - just let me know!",
+  };
+
+  return language === "Swedish" ? suggestions.sv : suggestions.en;
+}
+
+/**
+ * Create handoff tracker for a session
+ */
+function createHandoffTracker() {
+  return new HandoffTracker();
+}
+
+/**
+ * Serialize tracker state for storage
+ */
+function serializeTracker(tracker) {
+  return {
+    lowConfidenceCount: tracker.lowConfidenceCount,
+    uncertainResponseCount: tracker.uncertainResponseCount,
+    negativeSentimentCount: tracker.negativeSentimentCount,
+    sentimentHistory: tracker.sentimentHistory,
+  };
+}
+
+/**
+ * Restore tracker from serialized state
+ */
+function restoreTracker(state) {
+  const tracker = new HandoffTracker();
+  if (state) {
+    tracker.lowConfidenceCount = state.lowConfidenceCount || 0;
+    tracker.uncertainResponseCount = state.uncertainResponseCount || 0;
+    tracker.negativeSentimentCount = state.negativeSentimentCount || 0;
+    tracker.sentimentHistory = state.sentimentHistory || [];
+  }
+  return tracker;
 }
 
 module.exports = {
-  extractInsightsFromConversation,
-  processEndedConversations,
+  HANDOFF_REASONS,
+  HandoffTracker,
+  evaluateHandoffNeed,
+  getHandoffMessage,
+  getSoftHandoffSuggestion,
+  createHandoffTracker,
+  serializeTracker,
+  restoreTracker,
+  isExplicitHumanRequest,
+  detectFrustration,
+  isOffTopicOrAccountIssue,
 };

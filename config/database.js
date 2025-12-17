@@ -187,36 +187,8 @@ async function initDb() {
     `);
 
     // =============================================================================
-    // CUSTOMER MEMORY SYSTEM (Phase 1)
+    // HANDOFF TRACKING (Phase 1)
     // =============================================================================
-
-    // Customer memory table for cross-session personalization
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS customer_memory (
-        id SERIAL PRIMARY KEY,
-        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-        customer_id TEXT NOT NULL,
-        memory_type TEXT NOT NULL,
-        key TEXT,
-        value TEXT NOT NULL,
-        confidence FLOAT DEFAULT 0.8,
-        source_conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ DEFAULT now(),
-        last_seen TIMESTAMPTZ DEFAULT now(),
-        mention_count INTEGER DEFAULT 1,
-        UNIQUE (store_id, customer_id, memory_type, key, value)
-      );
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_customer_memory_lookup 
-      ON customer_memory(store_id, customer_id);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_customer_memory_type 
-      ON customer_memory(memory_type);
-    `);
 
     // Handoff tracking columns for conversations
     await pool.query(
@@ -227,9 +199,6 @@ async function initDb() {
     );
     await pool.query(
       `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS handoff_tracker JSONB DEFAULT '{}';`
-    );
-    await pool.query(
-      `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS customer_id TEXT;`
     );
 
     // =============================================================================
