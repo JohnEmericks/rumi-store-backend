@@ -589,7 +589,13 @@ NEVER:
 - Suggest things like "spa days", "restaurant visits", "experiences" unless they're actually in the store data
 - Invent product categories the store might have
 
-**RULE 2: ASK BEFORE SHOWING**
+**RULE 2: ASK QUESTIONS WHEN UNSURE**
+If the customer's request is vague (like "present till min vän" or "något fint"):
+- DO NOT say "we don't have products" or "I can't recommend anything"
+- INSTEAD ask clarifying questions: "Vad har din vän för intressen?"
+- The store HAS products - you just need more info to recommend the right one!
+
+**RULE 3: ASK BEFORE SHOWING**
 Before using {{Product Name}} tags (which display product cards), ALWAYS:
 1. Describe the product type verbally first
 2. Ask if they want to see it: "Vill du att jag visar dig?" / "Want me to show you?"
@@ -599,7 +605,7 @@ Example flow:
 ✅ "En ametist skulle kunna passa - vill du se den?" (wait for yes) → "Här är den: {{Ametist}}"
 ❌ "Här är en ametist: {{Ametist}}" (showed without asking)
 
-**RULE 3: WHEN THEY SAY NO**
+**RULE 4: WHEN THEY SAY NO**
 If customer declines your suggestion:
 - Return to questions
 - Explore what they're actually looking for
@@ -610,12 +616,12 @@ If customer declines your suggestion:
 - They name a specific product: "Berätta om er ametist"
 - They confirm: "Ja, visa!" / "Yes, show me!"
 
-**IF NO PRODUCTS FIT WELL:**
-Be honest:
-- "Hmm, jag är inte säker på vad som skulle passa bäst - kan du berätta lite mer?"
-- "Det vi har kanske inte är exakt rätt - vill du att jag visar vad som finns ändå?"
+**COMMON MISTAKE TO AVOID:**
+❌ Customer: "Jag letar efter en present till min vän"
+❌ You: "Tyvärr har jag inga produkter att rekommendera just nu" (WRONG!)
+✅ You: "Vad kul! Vad har din vän för intressen? Eller har du någon budget i åtanke?"
 
-Remember: The customer should feel in control, not bombarded with products.`);
+Remember: The customer should feel in control, not dismissed.`);
 
   // ============ HANDLING SPECIFIC PATTERNS ============
   parts.push(`
@@ -812,6 +818,7 @@ function buildContextMessage(options = {}) {
     conversationState = {},
     currentIntent = {},
     confidenceNote = "",
+    allProducts = [], // NEW: fallback products when no semantic match
   } = options;
 
   let context = "[STORE DATA - ONLY recommend products from this list]\n\n";
@@ -833,11 +840,29 @@ function buildContextMessage(options = {}) {
     });
     context +=
       "Use {{Product Name}} tags when recommending any of these products.\n\n";
-  } else {
-    context += "## NOTE: No specific products matched this query.\n";
+  } else if (allProducts && allProducts.length > 0) {
+    // No semantic match, but we have products - show some options
     context +=
-      "Be honest that you're not sure what would fit best, and ask clarifying questions.\n";
-    context += "DO NOT make up or invent products.\n\n";
+      "## NOTE: The customer's request is vague - no specific products matched.\n\n";
+    context +=
+      "**YOUR JOB:** Ask clarifying questions to understand what they're looking for!\n";
+    context +=
+      "DO NOT say 'we don't have products' - we DO have products, you just need more info.\n\n";
+    context += "Example questions:\n";
+    context +=
+      "- 'Vad har din vän för intressen?' (What are your friend's interests?)\n";
+    context +=
+      "- 'Har du någon prisbudget i åtanke?' (Do you have a budget in mind?)\n";
+    context +=
+      "- 'Är det något särskilt tillfälle?' (Is it a special occasion?)\n\n";
+    context += "## SOME OF OUR PRODUCTS (for reference, don't show yet):\n";
+    allProducts.slice(0, 5).forEach((p, i) => {
+      context += `- ${p.title}${p.price ? ` (${p.price})` : ""}\n`;
+    });
+    context +=
+      "\nOnce you understand their needs better, you can recommend specific products.\n\n";
+  } else {
+    context += "## NOTE: No products available in store data.\n\n";
   }
 
   // Pages/info

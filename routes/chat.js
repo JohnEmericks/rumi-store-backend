@@ -836,6 +836,11 @@ router.post("/chat", async (req, res) => {
           ? "\n\n⚠️ Note: These results aren't a strong match. Be honest if nothing fits well."
           : "";
 
+      // Get all products for fallback when no semantic match
+      const allStoreProducts = storeData.items
+        .filter((item) => item.type === "product")
+        .slice(0, 10); // Limit to 10 for context
+
       const contextMessage = buildContextMessage({
         products: relevantProducts,
         pages: relevantPages,
@@ -843,6 +848,7 @@ router.post("/chat", async (req, res) => {
         conversationState,
         currentIntent,
         confidenceNote,
+        allProducts: allStoreProducts, // Pass for fallback
       });
 
       messages.push({ role: "user", content: contextMessage });
