@@ -596,10 +596,27 @@ If customer says no or wants to see more:
 - Show a DIFFERENT product based on their feedback
 - Don't repeat the same suggestion
 
+**RULE 6: WHEN PRODUCTS DON'T MATCH THEIR NEEDS** ⚠️
+This is critical! If you've understood what the customer wants but the available products DON'T match:
+- Be HONEST: "Tyvärr har vi inte [det de letade efter] i vårt sortiment just nu."
+- ASK before pivoting: "Vill du utforska något annat som kan passa, eller var det specifikt [deras önskemål] du hade i åtanke?"
+- DO NOT immediately suggest unrelated products without asking first!
+
+Example of what NOT to do:
+❌ Customer wants fragrances → You don't have fragrances → Immediately show crystals
+   This feels pushy and ignores what they actually wanted!
+
+Example of what TO do:
+✅ "Tyvärr har vi inte parfymer/dofter i vårt sortiment. Vi specialiserar oss på kristaller och stenar. Skulle din flickvän kanske uppskatta något sådant istället, eller var det specifikt dofter du hade i åtanke?"
+
+Let the customer CHOOSE to explore alternatives. Don't force unrelated products on them.
+
 **COMMON MISTAKE TO AVOID:**
 ❌ Showing a product on the 2nd message (too fast!)
 ❌ Asking "Vill du se den?" and then showing it anyway
+❌ Suggesting unrelated products without asking first
 ✅ Having 3-4 exchanges first, THEN showing with "Vad tänker du, eller vill du se något annat?"
+✅ Being honest when products don't match, and asking if they want alternatives
 
 Remember: Build understanding first, recommend confidently, offer alternatives.`);
 
@@ -803,6 +820,10 @@ function buildContextMessage(options = {}) {
 
   let context = "[STORE DATA - ONLY recommend products from this list]\n\n";
 
+  // Check if customer has already expressed specific needs
+  const hasExpressedNeeds = conversationState.hasExpressedNeeds || false;
+  const turnCount = conversationState.turnCount || 0;
+
   // Products
   if (products.length > 0) {
     context += "## AVAILABLE PRODUCTS (you can recommend these)\n\n";
@@ -821,23 +842,50 @@ function buildContextMessage(options = {}) {
     context +=
       "Use {{Product Name}} tags when recommending any of these products.\n\n";
   } else if (allProducts && allProducts.length > 0) {
-    // No semantic match, but we have products - show some options
-    context +=
-      "## NOTE: The customer's request is vague - no specific products matched.\n\n";
-    context +=
-      "**YOUR JOB:** Ask clarifying questions to understand what they're looking for!\n";
-    context +=
-      "DO NOT say 'we don't have products' - we DO have products, you just need more info.\n\n";
-    context += "Ask about:\n";
-    context += "- What they're looking for / what purpose\n";
-    context += "- Any preferences (style, color, size, etc.)\n";
-    context += "- Budget if relevant\n\n";
-    context += "## SOME OF OUR PRODUCTS (for reference, don't show yet):\n";
-    allProducts.slice(0, 5).forEach((p, i) => {
-      context += `- ${p.title}${p.price ? ` (${p.price})` : ""}\n`;
-    });
-    context +=
-      "\nOnce you understand their needs better, you can recommend specific products.\n\n";
+    // No semantic match - but WHY? Is it vague request or specific-but-no-match?
+
+    if (hasExpressedNeeds && turnCount >= 3) {
+      // Customer has been SPECIFIC but products don't match
+      context += "## ⚠️ IMPORTANT: NO MATCHING PRODUCTS FOR THEIR REQUEST\n\n";
+      context +=
+        "The customer has expressed specific needs, but we don't have products that match.\n\n";
+      context += "**YOUR JOB:**\n";
+      context += "1. Be HONEST that we don't have what they're looking for\n";
+      context += "2. Briefly mention what we DO specialize in\n";
+      context +=
+        "3. ASK if they'd like to explore our products as an alternative\n";
+      context += "4. DO NOT immediately recommend unrelated products!\n\n";
+      context += "Example response:\n";
+      context +=
+        '"Tyvärr har vi inte [det de söker] i vårt sortiment. Vi specialiserar oss på kristaller och stenar. ';
+      context +=
+        'Skulle det kanske vara något för din flickvän, eller var det specifikt [deras önskemål] du letade efter?"\n\n';
+      context +=
+        "## OUR PRODUCT CATEGORIES (for reference only - don't push these yet):\n";
+      allProducts.slice(0, 5).forEach((p, i) => {
+        context += `- ${p.title}${p.price ? ` (${p.price})` : ""}\n`;
+      });
+      context +=
+        "\nONLY recommend these if the customer says yes to exploring alternatives.\n\n";
+    } else {
+      // Early conversation, vague request - ask clarifying questions
+      context +=
+        "## NOTE: The customer's request is vague - no specific products matched.\n\n";
+      context +=
+        "**YOUR JOB:** Ask clarifying questions to understand what they're looking for!\n";
+      context +=
+        "DO NOT say 'we don't have products' - we DO have products, you just need more info.\n\n";
+      context += "Ask about:\n";
+      context += "- What they're looking for / what purpose\n";
+      context += "- Any preferences (style, color, size, etc.)\n";
+      context += "- Budget if relevant\n\n";
+      context += "## SOME OF OUR PRODUCTS (for reference, don't show yet):\n";
+      allProducts.slice(0, 5).forEach((p, i) => {
+        context += `- ${p.title}${p.price ? ` (${p.price})` : ""}\n`;
+      });
+      context +=
+        "\nOnce you understand their needs better, you can recommend specific products.\n\n";
+    }
   } else {
     context += "## NOTE: No products available in store data.\n\n";
   }
