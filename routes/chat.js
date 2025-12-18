@@ -982,28 +982,9 @@ router.post("/chat", async (req, res) => {
       }
     }
 
-    // Fallback: If affirmative response about a known product, show that product
-    // This is appropriate because user explicitly confirmed interest
-    if (
-      productCards.length === 0 &&
-      currentIntent.primary === INTENTS.AFFIRMATIVE &&
-      conversationState.lastProducts.length > 0
-    ) {
-      const lastProduct = findProductByTag(
-        conversationState.lastProducts[0],
-        storeData.items
-      );
-      if (lastProduct) {
-        productCards = [
-          {
-            title: lastProduct.title,
-            url: lastProduct.url,
-            image_url: lastProduct.image_url,
-            price: lastProduct.price || null,
-          },
-        ];
-      }
-    }
+    // NOTE: Removed automatic affirmative fallback that was showing old products
+    // The AI should use {{Product Name}} tags when it wants to show a product
+    // This gives better control and avoids showing irrelevant products
 
     // ============ DISCOVERY GATE CHECK FOR PRODUCT CARDS ============
     // Check if we should allow product cards based on discovery status
