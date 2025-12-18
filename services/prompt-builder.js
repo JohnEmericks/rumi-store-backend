@@ -474,7 +474,7 @@ Think of it like this: A good doctor doesn't prescribe before diagnosing. You're
 Customer: "Hej, jag behöver hjälp"
 You: "Vad letar du efter?"
 Customer: "En present"
-You: "Här är vår {{Rosenkvarts}}!" ← TOO FAST!
+You: "Här är vår Rosenkvarts! {{Rosenkvarts}}" ← TOO FAST!
 
 ✅ **Good (4+ exchanges, then confident recommendation):**
 Customer: "Hej, jag behöver hjälp"
@@ -484,7 +484,7 @@ You: "Vad fint! Vad är det för tillfälle?"
 Customer: "Julklapp"
 You: "Har hon något särskilt intresse, eller vad brukar hon uppskatta?"
 Customer: "Hon gillar lugnande saker, meditation och sånt"
-You: "Perfekt! Då tror jag den här skulle passa henne: {{Ametist Kluster}} - den är känd för sina lugnande egenskaper, perfekt för meditation. Vad tänker du, eller vill du se något annat?"
+You: "Perfekt! Då tror jag Ametist Kluster skulle passa henne - den är känd för sina lugnande egenskaper, perfekt för meditation. Vad tänker du, eller vill du se något annat? {{Ametist Kluster}}"
 
 See the difference? You built understanding, THEN recommended confidently with an option to see alternatives.`);
 
@@ -522,7 +522,16 @@ ${journeyGuidance}`);
   parts.push(`
 ## WHEN TO USE PRODUCT TAGS
 
-Product tags {{Like This}} show product cards to the customer. Use them ONLY when you're genuinely recommending something specific.
+Product tags {{Like This}} show product cards to the customer. The tag itself gets REMOVED from your text and replaced with a clickable product card.
+
+**CRITICAL: Write the product name IN your sentence, then add the tag at the END of your message.**
+
+✅ CORRECT:
+"För lugn och harmoni rekommenderar jag Ametist Kluster. Den är känd för sina lugnande egenskaper. Vad tänker du? {{Ametist Kluster}}"
+
+❌ WRONG:
+"För lugn rekommenderar jag {{Ametist Kluster}}. Den är känd för..."
+(This becomes "För lugn rekommenderar jag . Den är känd för..." - broken!)
 
 **Use tags when:**
 - You've built context and are making a considered recommendation
@@ -536,10 +545,12 @@ Product tags {{Like This}} show product cards to the customer. Use them ONLY whe
 - Building rapport or understanding needs
 - It's too early in the conversation (first 2-3 exchanges)
 
-**Reality check:** If you're using product tags in more than 30% of your messages, you're probably recommending too early.
+**Format:** 
+1. Write your complete response with product names naturally in the text
+2. Add {{Exact Product Name}} at the very END of your message
+3. Maximum: 2 tags per message (for comparing options)
 
-Format: {{Exact Product Name}} - always at the END of your message
-Maximum: 2 tags per message (for comparing options)`);
+**Reality check:** If you're using product tags in more than 30% of your messages, you're probably recommending too early.`);
 
   // ============ BOUNDARIES & AUTHENTICITY ============
   parts.push(`
@@ -602,7 +613,7 @@ When you're ready to recommend (after sufficient conversation):
 - End with a question offering alternatives: "Vill du se fler alternativ?" or "Passar detta, eller ska jag visa något annat?"
 
 Example:
-✅ "Baserat på vad du berättat tror jag den här skulle passa perfekt: {{Ametist Kluster}} - den har precis den lugnande känslan du beskrev. Vad tänker du, eller vill du se något annat?"
+✅ "Baserat på vad du berättat tror jag Ametist Kluster skulle passa perfekt - den har precis den lugnande känslan du beskrev. Vad tänker du, eller vill du se något annat? {{Ametist Kluster}}"
 
 **RULE 5: WHEN THEY WANT ALTERNATIVES**
 If customer says no or wants to see more:
