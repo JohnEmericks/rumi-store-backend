@@ -704,15 +704,36 @@ router.post("/chat", async (req, res) => {
         /billigare|dyrare|annat|andra|alternativ|fler|mer|olika|cheaper|expensive|different|other|alternative|more/i;
       const isAskingForAlternatives = alternativePatterns.test(message);
 
+      // Check if user rejected the last suggestion
+      const rejectionPatterns =
+        /^(nej|nä|nope|no|inte|ej|visa (något |nåt )?annat|något annat|nåt annat|don't want|vill inte)/i;
+      const isRejection =
+        rejectionPatterns.test(message.trim()) ||
+        currentIntent.primary === INTENTS.NEGATIVE;
+
       // Check if user is asking about price
       const isPriceQuery = currentIntent.primary === INTENTS.PRICE_CHECK;
 
       let queryForEmbedding = message;
+      let productsToExclude = [];
+
+      // If rejecting or asking for alternatives, exclude previously shown products
+      if (
+        (isRejection || isAskingForAlternatives) &&
+        conversationState.lastProducts.length > 0
+      ) {
+        productsToExclude = [...conversationState.lastProducts];
+        console.log(
+          `[RAG] Will exclude previously shown products: ${productsToExclude.join(
+            ", "
+          )}`
+        );
+      }
 
       // If asking for alternatives and we have previous product context,
-      // search based on the previous product instead of "billigare"
+      // search based on the previous product instead of "billigare" or "nej"
       if (
-        (isAskingForAlternatives || isPriceQuery) &&
+        (isAskingForAlternatives || isPriceQuery || isRejection) &&
         conversationState.lastProducts.length > 0
       ) {
         queryForEmbedding =
@@ -720,7 +741,7 @@ router.post("/chat", async (req, res) => {
             conversationState.lastProducts.length - 1
           ];
         console.log(
-          `[RAG] Alternative request detected - searching based on: "${queryForEmbedding}"`
+          `[RAG] Alternative/rejection detected - searching based on: "${queryForEmbedding}"`
         );
       }
 
@@ -735,11 +756,28 @@ router.post("/chat", async (req, res) => {
         }))
         .sort((a, b) => b.score - a.score);
 
-      const scoredProducts = scored.filter((s) => s.item.type === "product");
+      let scoredProducts = scored.filter((s) => s.item.type === "product");
       const scoredPages = scored.filter((s) => s.item.type === "page");
 
-      // Context-aware boosting (boost products from ongoing conversation)
-      if (conversationState.lastProducts.length > 0) {
+      // EXCLUDE rejected/already shown products when user wants alternatives
+      if (productsToExclude.length > 0) {
+        const beforeCount = scoredProducts.length;
+        scoredProducts = scoredProducts.filter(
+          (s) => !productsToExclude.includes(s.item.title)
+        );
+        console.log(
+          `[RAG] Excluded ${
+            beforeCount - scoredProducts.length
+          } already-shown products`
+        );
+      }
+
+      // Context-aware boosting - BUT NOT when user rejected or wants alternatives
+      if (
+        conversationState.lastProducts.length > 0 &&
+        !isRejection &&
+        !isAskingForAlternatives
+      ) {
         scoredProducts.forEach((s) => {
           if (conversationState.lastProducts.includes(s.item.title)) {
             s.score *= 1.3;
@@ -760,16 +798,16 @@ router.post("/chat", async (req, res) => {
         console.log(
           `[RAG] Info intent - retrieved ${relevantPages.length} pages, 0 products`
         );
-      } else if (isAskingForAlternatives || isPriceQuery) {
-        // For alternative/price requests, include MORE products with LOWER threshold
+      } else if (isAskingForAlternatives || isPriceQuery || isRejection) {
+        // For alternative/price/rejection requests, include MORE products with LOWER threshold
         // so the AI can suggest different options
         relevantProducts = scoredProducts
           .slice(0, 12) // More products
-          .filter((s) => s.score >= 0.3); // Lower threshold
+          .filter((s) => s.score >= 0.25); // Even lower threshold for alternatives
         relevantPages = scoredPages.slice(0, 2).filter((s) => s.score >= 0.3);
         bestProductScore = scoredProducts[0]?.score || 0;
         console.log(
-          `[RAG] Alternative/price request - retrieved ${relevantProducts.length} products with lower threshold`
+          `[RAG] Alternative/price/rejection request - retrieved ${relevantProducts.length} products (excluding ${productsToExclude.length} shown)`
         );
       } else {
         // Normal product retrieval
