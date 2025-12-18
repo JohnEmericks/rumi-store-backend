@@ -895,9 +895,9 @@ router.post("/chat", async (req, res) => {
     // ============ PRODUCT CARD SELECTION ============
     let productCards = [];
 
-    // Find all tagged products (max 2 cards)
+    // Find tagged product (only ONE at a time for conversational flow)
     if (taggedProductNames.length > 0) {
-      for (const taggedName of taggedProductNames.slice(0, 2)) {
+      for (const taggedName of taggedProductNames.slice(0, 1)) {
         const matchedProduct = findProductByTag(taggedName, storeData.items);
         if (matchedProduct) {
           // Avoid duplicates

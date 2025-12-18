@@ -16,10 +16,10 @@ const { INTENTS } = require("./intent-classifier");
  */
 const CONFIG = {
   // Minimum exchanges before products can be shown for general browsing
-  MINIMUM_EXCHANGES_FOR_RECOMMENDATIONS: 3,
+  MINIMUM_EXCHANGES_FOR_RECOMMENDATIONS: 2,
 
   // Minimum "needs score" before we consider discovery complete
-  MINIMUM_NEEDS_SCORE: 3,
+  MINIMUM_NEEDS_SCORE: 2,
 
   // Intents that bypass the discovery gate (explicit product requests)
   EXPLICIT_PRODUCT_INTENTS: [
