@@ -805,21 +805,13 @@ router.post("/chat", async (req, res) => {
 
     const messages = [{ role: "system", content: systemPrompt }];
 
-    // Add conversation history
-    const historyRows = await pool.query(
-      "SELECT role, content, products_shown FROM conv_messages WHERE conversation_id = $1 ORDER BY created_at ASC",
-      [conversation?.id]
-    );
-
-    const conversationHistory = historyRows.rows.map((row) => ({
-      role: row.role,
-      content: row.content,
-      products_shown: row.products_shown,
-    }));
-
-    conversationHistory.forEach((turn) => {
-      messages.push({ role: turn.role, content: turn.content });
-    });
+    // Use history from request body (current session only, managed by frontend)
+    // NOT from database - no cross-session memory
+    if (history && history.length > 0) {
+      history.forEach((turn) => {
+        messages.push({ role: turn.role, content: turn.content });
+      });
+    }
 
     // Add current user message
     messages.push({ role: "user", content: message });
