@@ -699,7 +699,32 @@ router.post("/chat", async (req, res) => {
         )}..."`
       );
 
-      const [queryVector] = await embedTexts([message]);
+      // Check if user is asking for alternatives/cheaper/different options
+      const alternativePatterns =
+        /billigare|dyrare|annat|andra|alternativ|fler|mer|olika|cheaper|expensive|different|other|alternative|more/i;
+      const isAskingForAlternatives = alternativePatterns.test(message);
+
+      // Check if user is asking about price
+      const isPriceQuery = currentIntent.primary === INTENTS.PRICE_CHECK;
+
+      let queryForEmbedding = message;
+
+      // If asking for alternatives and we have previous product context,
+      // search based on the previous product instead of "billigare"
+      if (
+        (isAskingForAlternatives || isPriceQuery) &&
+        conversationState.lastProducts.length > 0
+      ) {
+        queryForEmbedding =
+          conversationState.lastProducts[
+            conversationState.lastProducts.length - 1
+          ];
+        console.log(
+          `[RAG] Alternative request detected - searching based on: "${queryForEmbedding}"`
+        );
+      }
+
+      const [queryVector] = await embedTexts([queryForEmbedding]);
 
       // Score all items
       const scored = storeData.items
@@ -734,6 +759,17 @@ router.post("/chat", async (req, res) => {
         relevantProducts = []; // Don't show products for info queries
         console.log(
           `[RAG] Info intent - retrieved ${relevantPages.length} pages, 0 products`
+        );
+      } else if (isAskingForAlternatives || isPriceQuery) {
+        // For alternative/price requests, include MORE products with LOWER threshold
+        // so the AI can suggest different options
+        relevantProducts = scoredProducts
+          .slice(0, 12) // More products
+          .filter((s) => s.score >= 0.3); // Lower threshold
+        relevantPages = scoredPages.slice(0, 2).filter((s) => s.score >= 0.3);
+        bestProductScore = scoredProducts[0]?.score || 0;
+        console.log(
+          `[RAG] Alternative/price request - retrieved ${relevantProducts.length} products with lower threshold`
         );
       } else {
         // Normal product retrieval
