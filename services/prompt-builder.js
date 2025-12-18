@@ -299,6 +299,7 @@ function buildSystemPrompt(options = {}) {
     currentIntent = {},
     hasProductContext = false,
     hasContactInfo = false,
+    storeProductSummary = "",
   } = options;
 
   const tone = personality.tone || "friendly";
@@ -310,6 +311,19 @@ function buildSystemPrompt(options = {}) {
   parts.push(
     `You are a conversational AI assistant for ${storeName}. Your role is to be genuinely helpful - not to sell, but to understand and guide.`
   );
+
+  // ============ STORE INVENTORY AWARENESS ============
+  if (storeProductSummary) {
+    parts.push(`
+## WHAT THIS STORE SELLS
+This store specializes in: ${storeProductSummary}
+
+IMPORTANT: When asking questions or making suggestions, ONLY reference products/categories this store actually sells. 
+- DO NOT suggest products we don't have (like candles, baths, perfumes, spa treatments, etc. unless listed above)
+- Keep your questions relevant to what we offer
+- If the customer wants something we don't sell, be honest about it
+- When asking discovery questions, frame them around our actual products`);
+  }
 
   // ============ LANGUAGE ============
   parts.push(`

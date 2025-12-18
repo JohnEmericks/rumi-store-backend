@@ -774,6 +774,16 @@ router.post("/chat", async (req, res) => {
     }
 
     // ============ BUILD CONTEXT & SYSTEM PROMPT ============
+    // Extract product categories so AI knows what the store sells (even during discovery)
+    const productTypes = [
+      ...new Set(
+        storeData.items
+          .filter((item) => item.type === "product")
+          .map((item) => item.title)
+      ),
+    ];
+    const storeProductSummary = productTypes.slice(0, 10).join(", ");
+
     let systemPrompt = buildSystemPrompt({
       storeName: storeData.storeName || "this store",
       personality: storeData.personality,
@@ -782,6 +792,7 @@ router.post("/chat", async (req, res) => {
       currentIntent,
       hasProductContext: relevantProducts.length > 0,
       hasContactInfo: storeFacts.length > 0,
+      storeProductSummary,
     });
 
     // Add discovery gate guidance if discovery is incomplete
@@ -805,13 +816,21 @@ router.post("/chat", async (req, res) => {
 
     const messages = [{ role: "system", content: systemPrompt }];
 
-    // Use history from request body (current session only, managed by frontend)
-    // NOT from database - no cross-session memory
-    if (history && history.length > 0) {
-      history.forEach((turn) => {
-        messages.push({ role: turn.role, content: turn.content });
-      });
-    }
+    // Add conversation history
+    const historyRows = await pool.query(
+      "SELECT role, content, products_shown FROM conv_messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      [conversation?.id]
+    );
+
+    const conversationHistory = historyRows.rows.map((row) => ({
+      role: row.role,
+      content: row.content,
+      products_shown: row.products_shown,
+    }));
+
+    conversationHistory.forEach((turn) => {
+      messages.push({ role: turn.role, content: turn.content });
+    });
 
     // Add current user message
     messages.push({ role: "user", content: message });
