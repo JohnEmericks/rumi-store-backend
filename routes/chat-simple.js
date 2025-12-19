@@ -7,16 +7,16 @@
 
 const express = require("express");
 const router = express.Router();
-const { pool } = require("../db");
-const { embedTexts, cosineSimilarity } = require("../services/embeddings");
+const { pool } = require("../config/database");
+const {
+  openai,
+  embedTexts,
+  cosineSimilarity,
+} = require("../services/embedding");
 const {
   buildSystemPrompt,
   buildContextMessage,
 } = require("../services/prompt-simple");
-
-// Use the same OpenAI client as main chat
-const OpenAI = require("openai");
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
  * Load store data from database
