@@ -234,6 +234,17 @@ router.post("/chat", async (req, res) => {
     // ========== RAG: Find relevant products ==========
     const [queryVector] = await embedTexts([message]);
 
+    // Detect comparative/superlative queries that need price or size context
+    const priceQuery =
+      /dyrast|billigast|dyr|billig|expensive|cheap|pris|price|kostar/i.test(
+        message
+      );
+    const sizeQuery =
+      /störst|minst|större|mindre|biggest|smallest|bigger|smaller|stor|liten/i.test(
+        message
+      );
+    const comparativeQuery = priceQuery || sizeQuery;
+
     const scored = storeData.items
       .filter((item) => item.type !== "product" || item.in_stock !== false)
       .map((item) => ({
@@ -242,9 +253,33 @@ router.post("/chat", async (req, res) => {
       }))
       .sort((a, b) => b.score - a.score);
 
-    const relevantProducts = scored
-      .filter((s) => s.item.type === "product")
-      .slice(0, 8);
+    let relevantProducts;
+
+    if (comparativeQuery) {
+      // For comparative queries, include ALL products so AI can reason about price/size
+      relevantProducts = scored
+        .filter((s) => s.item.type === "product")
+        .sort((a, b) => {
+          // Sort by price for price queries
+          if (priceQuery) {
+            const priceA =
+              parseFloat(String(a.item.price || "0").replace(/[^\d]/g, "")) ||
+              0;
+            const priceB =
+              parseFloat(String(b.item.price || "0").replace(/[^\d]/g, "")) ||
+              0;
+            return priceB - priceA; // Highest first
+          }
+          return b.score - a.score;
+        });
+      console.log(
+        `[Chat] Comparative query detected - including all ${relevantProducts.length} products`
+      );
+    } else {
+      relevantProducts = scored
+        .filter((s) => s.item.type === "product")
+        .slice(0, 8);
+    }
 
     const relevantPages = scored
       .filter((s) => s.item.type === "page" && s.score >= 0.3)
