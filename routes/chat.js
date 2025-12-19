@@ -87,14 +87,14 @@ async function loadStoreData(storeId) {
 /**
  * Get current usage for store
  */
-async function getCurrentUsage(storeDbId) {
+async function getCurrentUsage(licenseKeyId) {
   const result = await pool.query(
-    `SELECT COUNT(*) as count FROM conversations 
-     WHERE store_id = $1 
-     AND created_at >= date_trunc('month', CURRENT_DATE)`,
-    [storeDbId]
+    `SELECT conversations_used FROM usage_tracking 
+     WHERE license_key_id = $1 AND period_start <= now() AND period_end > now()
+     LIMIT 1`,
+    [licenseKeyId]
   );
-  return parseInt(result.rows[0]?.count || 0);
+  return result.rows[0]?.conversations_used || 0;
 }
 
 // ============================================================================
@@ -311,13 +311,17 @@ router.post("/chat", async (req, res) => {
   }
 
   // Usage limit check
-  const currentUsage = await getCurrentUsage(storeData.id);
-  if (storeData.planLimit && currentUsage >= storeData.planLimit) {
-    return res.status(403).json({
-      ok: false,
-      error: "usage_limit_reached",
-      message: `Monthly conversation limit reached (${storeData.planLimit})`,
-    });
+  if (storeData.planLimit !== null) {
+    const currentUsage = await getCurrentUsage(storeData.licenseKeyId);
+    if (currentUsage >= storeData.planLimit) {
+      return res.status(403).json({
+        ok: false,
+        error: "limit_reached",
+        message: `Monthly limit reached (${currentUsage}/${storeData.planLimit}).`,
+        show_to_customer:
+          "Chatten är tillfälligt otillgänglig. Vänligen försök igen senare.",
+      });
+    }
   }
 
   try {
