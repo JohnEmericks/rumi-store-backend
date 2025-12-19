@@ -28,6 +28,7 @@ const CONFIG = {
     INTENTS.AVAILABILITY, // "Do you have X?"
     INTENTS.PURCHASE, // "I want to buy X"
     INTENTS.COMPARE, // "Compare X and Y"
+    INTENTS.SEARCH, // "Do you have crystals for meditation?"
   ],
 
   // Intents that should NEVER trigger product recommendations
@@ -40,6 +41,18 @@ const CONFIG = {
     INTENTS.RETURNS,
   ],
 };
+
+/**
+ * Detect if customer sounds confident/knows what they want
+ * These customers should get products faster
+ */
+const CONFIDENT_CUSTOMER_PATTERNS = [
+  /\b(visa|show|ge mig|give me|jag vill ha|i want|jag tar|i'll take)\b/i,
+  /\b(rekommendera|recommend|föreslå|suggest)\b/i,
+  /\b(vilken|which|vad har ni|what do you have)\b.*\b(för|for)\b/i,
+  /\b(letar efter|looking for|söker|searching)\b.*\b(kristall|sten|crystal|stone)\b/i,
+  /\b(behöver|need)\b.*\b(för|for|till|to)\b/i,
+];
 
 /**
  * Needs indicators with weights
@@ -169,6 +182,15 @@ function calculateNeedsScore(history = [], currentMessage = "") {
 }
 
 /**
+ * Check if customer sounds confident/knows what they want
+ */
+function isConfidentCustomer(currentMessage) {
+  return CONFIDENT_CUSTOMER_PATTERNS.some((pattern) =>
+    pattern.test(currentMessage)
+  );
+}
+
+/**
  * Check if discovery is complete enough to show products
  *
  * @param {Object} conversationState - Current conversation state
@@ -189,8 +211,40 @@ function isDiscoveryComplete(
   // Use the better of: conversationState.hasExpressedNeeds OR our calculated score
   const needsSufficient = hasExpressedNeeds || needsAnalysis.sufficient;
 
-  // Check 1: Minimum exchanges (hard gate)
-  if (turnCount < CONFIG.MINIMUM_EXCHANGES_FOR_RECOMMENDATIONS) {
+  // Check if customer sounds confident/decisive
+  const confident = isConfidentCustomer(currentMessage);
+
+  // FAST PATH: Confident customer with any context - let them through!
+  if (confident && (turnCount >= 1 || needsAnalysis.score >= 1)) {
+    return {
+      complete: true,
+      reason: "confident_customer",
+      message: "Customer sounds confident and has some context",
+      turnCount,
+      needsScore: needsAnalysis.score,
+      needsCategories: needsAnalysis.categories,
+      needsSufficient: true,
+    };
+  }
+
+  // FAST PATH: High needs score bypasses turn count
+  if (needsAnalysis.score >= 3) {
+    return {
+      complete: true,
+      reason: "high_needs_score",
+      message: "Customer has expressed clear needs",
+      turnCount,
+      needsScore: needsAnalysis.score,
+      needsCategories: needsAnalysis.categories,
+      needsSufficient: true,
+    };
+  }
+
+  // Check 1: Minimum exchanges (soft gate - can be overridden)
+  if (
+    turnCount < CONFIG.MINIMUM_EXCHANGES_FOR_RECOMMENDATIONS &&
+    !needsSufficient
+  ) {
     return {
       complete: false,
       reason: "minimum_exchanges",
@@ -202,22 +256,8 @@ function isDiscoveryComplete(
     };
   }
 
-  // Check 2: Sufficient needs expressed (soft gate - can be overridden by high turn count)
-  if (!needsSufficient) {
-    // After 5 turns without needs, we might be stuck - allow products but flag it
-    if (turnCount >= 5) {
-      return {
-        complete: true,
-        reason: "turn_count_override",
-        message: `High turn count (${turnCount}) overrides needs requirement`,
-        turnCount,
-        needsScore: needsAnalysis.score,
-        needsCategories: needsAnalysis.categories,
-        needsSufficient: false,
-        warning: "Customer hasn't expressed clear needs despite many exchanges",
-      };
-    }
-
+  // Check 2: Sufficient needs expressed
+  if (!needsSufficient && turnCount < 3) {
     return {
       complete: false,
       reason: "insufficient_needs",
@@ -226,6 +266,19 @@ function isDiscoveryComplete(
       needsScore: needsAnalysis.score,
       needsCategories: needsAnalysis.categories,
       needsSufficient: false,
+    };
+  }
+
+  // After 3 turns, always allow (don't make customer wait forever)
+  if (turnCount >= 3) {
+    return {
+      complete: true,
+      reason: "turn_count_override",
+      message: `Sufficient turns (${turnCount})`,
+      turnCount,
+      needsScore: needsAnalysis.score,
+      needsCategories: needsAnalysis.categories,
+      needsSufficient: needsSufficient,
     };
   }
 
@@ -507,6 +560,7 @@ module.exports = {
   isDiscoveryComplete,
   shouldIncludeProductsInContext,
   shouldAllowProductCards,
+  isConfidentCustomer,
 
   // Helper functions
   calculateNeedsScore,
@@ -517,4 +571,5 @@ module.exports = {
   // Configuration (exported for testing/tuning)
   CONFIG,
   NEEDS_INDICATORS,
+  CONFIDENT_CUSTOMER_PATTERNS,
 };
