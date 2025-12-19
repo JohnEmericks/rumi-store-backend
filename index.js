@@ -14,8 +14,6 @@ const { initDb } = require("./config/database");
 // Import routes
 const storeRoutes = require("./routes/store");
 const chatRoutes = require("./routes/chat");
-// After line 16 (const chatRoutes = require("./routes/chat");)
-const chatSimpleRoutes = require("./routes/chat-simple");
 
 const analyticsRoutes = require("./routes/analytics");
 const adminRoutes = require("./routes/admin");
@@ -47,9 +45,6 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Store routes (register, index, personality, etc.)
 app.use("/", storeRoutes);
-
-// After line 49 (app.use("/", chatRoutes);)
-app.use("/", chatSimpleRoutes);
 
 // Chat routes (chat, end-conversation)
 app.use("/", chatRoutes);
