@@ -751,8 +751,8 @@ function getIntentGuidance(currentIntent, conversationState, language) {
       : "Customer is searching for something specific - help them find it or suggest alternatives",
 
     [INTENTS.PRODUCT_INFO]: sv
-      ? "Kunden vill veta mer om en produkt - ge relevant info från produktdatan"
-      : "Customer wants product details - provide relevant info from the product data",
+      ? "Kunden frågar om en specifik produkt - VISA produkten med {{Produktnamn}} och ge relevant info"
+      : "Customer asks about specific product - SHOW it with {{Product Name}} and give relevant info",
 
     [INTENTS.COMPARE]: sv
       ? "Kunden jämför produkter - lyft fram skillnader och hjälp dem välja"
