@@ -93,13 +93,13 @@ function buildContextMessage(options = {}) {
       const item = p.item || p;
       const price = item.price ? ` - ${item.price}` : "";
       parts.push(`\n**${item.title}**${price}`);
-      if (item.description) {
-        // Truncate long descriptions
-        const desc =
-          item.description.length > 300
-            ? item.description.slice(0, 300) + "..."
-            : item.description;
-        parts.push(desc);
+      if (item.content) {
+        // Truncate long content
+        const content =
+          item.content.length > 300
+            ? item.content.slice(0, 300) + "..."
+            : item.content;
+        parts.push(content);
       }
     });
   }

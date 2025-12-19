@@ -28,25 +28,20 @@ async function loadStoreData(storeId) {
               lk.is_active as license_active, lk.plan
        FROM stores s
        LEFT JOIN license_keys lk ON s.license_key_id = lk.id
-       WHERE s.id = $1`,
+       WHERE s.store_id = $1`,
       [storeId]
     );
 
-    if (storeRow.rows.length === 0) return null;
+    if (storeRow.rowCount === 0) return null;
 
     const store = storeRow.rows[0];
+    const storeDbId = store.id;
 
-    // Load scraped items
+    // Load items using internal DB id
     const itemsRow = await pool.query(
-      `SELECT title, url, type, content, description, price, image_url, in_stock, embedding
-       FROM scraped_items WHERE store_id = $1`,
-      [storeId]
+      "SELECT type, title, url, image_url, content, embedding, price, in_stock FROM store_items WHERE store_id = $1",
+      [storeDbId]
     );
-
-    const items = itemsRow.rows.map((row) => ({
-      ...row,
-      embedding: row.embedding ? JSON.parse(row.embedding) : null,
-    }));
 
     return {
       id: store.id,
@@ -54,7 +49,16 @@ async function loadStoreData(storeId) {
       personality: store.personality || {},
       licenseActive: store.license_active,
       plan: store.plan,
-      items,
+      items: itemsRow.rows.map((r) => ({
+        type: r.type,
+        title: r.title,
+        url: r.url,
+        image_url: r.image_url,
+        content: r.content,
+        embedding: r.embedding,
+        price: r.price,
+        in_stock: r.in_stock,
+      })),
     };
   } catch (error) {
     console.error("Error loading store data:", error);
@@ -113,10 +117,15 @@ router.post("/chat-simple", async (req, res) => {
 
   // Load store
   const storeData = await loadStoreData(store_id);
-  if (!storeData?.items?.length) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Store not found or no products" });
+
+  if (!storeData) {
+    console.log(`[Simple Chat] Store not found: ${store_id}`);
+    return res.status(400).json({ ok: false, error: "Store not found" });
+  }
+
+  if (!storeData.items?.length) {
+    console.log(`[Simple Chat] No items for store: ${store_id}`);
+    return res.status(400).json({ ok: false, error: "No products in store" });
   }
 
   if (!storeData.licenseActive) {
@@ -191,7 +200,7 @@ router.post("/chat-simple", async (req, res) => {
 
     // ============ CALL AI ============
     const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+      model: "gpt-4o",
       messages,
       max_tokens: 500,
       temperature: 0.7,
