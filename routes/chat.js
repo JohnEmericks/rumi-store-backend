@@ -109,40 +109,38 @@ async function getCurrentUsage(licenseKeyId) {
 }
 
 // ============================================================================
-// PRODUCT MATCHING
+// CONTENT MATCHING (products, pages, blog posts)
 // ============================================================================
 
 /**
- * Find product by tag name (fuzzy matching)
+ * Find any content by tag name (fuzzy matching)
+ * Searches products first, then pages
  */
-function findProductByTag(tagName, items) {
+function findContentByTag(tagName, items) {
   const normalizedTag = tagName.toLowerCase().trim();
 
-  // Exact match first
-  let match = items.find(
-    (item) =>
-      item.type === "product" && item.title.toLowerCase() === normalizedTag
-  );
+  // Exact match first (any type)
+  let match = items.find((item) => item.title.toLowerCase() === normalizedTag);
 
   // Partial match - tag contains title or title contains tag
   if (!match) {
     match = items.find(
       (item) =>
-        item.type === "product" &&
-        (item.title.toLowerCase().includes(normalizedTag) ||
-          normalizedTag.includes(item.title.toLowerCase()))
+        item.title.toLowerCase().includes(normalizedTag) ||
+        normalizedTag.includes(item.title.toLowerCase())
     );
   }
 
-  // Word-based partial match
+  // Word-based partial match (for longer titles)
   if (!match) {
     const tagWords = normalizedTag.split(/\s+/);
     match = items.find((item) => {
-      if (item.type !== "product") return false;
       const titleLower = item.title.toLowerCase();
-      return tagWords.some(
+      // Match if most significant words match
+      const matchingWords = tagWords.filter(
         (word) => word.length > 3 && titleLower.includes(word)
       );
+      return matchingWords.length >= Math.min(2, tagWords.length);
     });
   }
 
@@ -426,21 +424,25 @@ router.post("/chat", async (req, res) => {
     // Remove tags from displayed answer
     const answer = rawAnswer.replace(/\s*\{\{[^}]+\}\}/g, "").trim();
 
-    // ========== BUILD PRODUCT CARDS ==========
-    let productCards = [];
+    // ========== BUILD CONTENT CARDS (products, pages, blog posts) ==========
+    let contentCards = [];
 
     if (taggedProductNames.length > 0) {
-      // Only show first tagged product (one at a time)
-      const matchedProduct = findProductByTag(
+      // Only show first tagged content (one at a time)
+      const matchedContent = findContentByTag(
         taggedProductNames[0],
         storeData.items
       );
-      if (matchedProduct) {
-        productCards.push({
-          title: matchedProduct.title,
-          url: matchedProduct.url,
-          image_url: matchedProduct.image_url,
-          price: matchedProduct.price || null,
+      if (matchedContent) {
+        contentCards.push({
+          type: matchedContent.type, // "product" or "page"
+          title: matchedContent.title,
+          url: matchedContent.url,
+          image_url: matchedContent.image_url || null,
+          price:
+            matchedContent.type === "product"
+              ? matchedContent.price || null
+              : null,
         });
       }
     }
@@ -450,22 +452,22 @@ router.post("/chat", async (req, res) => {
       conversation.id,
       "assistant",
       answer,
-      productCards.map((p) => p.title)
+      contentCards.map((p) => p.title)
     );
 
-    console.log(`[Chat] Response ready, ${productCards.length} product cards`);
+    console.log(`[Chat] Response ready, ${contentCards.length} content cards`);
 
     return res.json({
       ok: true,
       answer,
-      product_cards: productCards,
+      product_cards: contentCards, // Keep name for backward compatibility
       debug: {
         ai_provider: AI_PROVIDER,
         products_in_context: relevantProducts.length,
         pages_in_context: relevantPages.length,
         pages_found: relevantPages.map((p) => p.item.title),
         tags_found: taggedProductNames,
-        products_matched: productCards.length,
+        cards_matched: contentCards.length,
       },
     });
   } catch (err) {
