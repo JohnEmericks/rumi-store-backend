@@ -283,7 +283,7 @@ router.post("/chat", async (req, res) => {
 
     // Detect page/info related queries
     const pageQuery =
-      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt/i.test(
+      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt|porto|skicka|skickas|kostar det|vad kostar|pris på frakt/i.test(
         message
       );
 
@@ -292,7 +292,10 @@ router.post("/chat", async (req, res) => {
       // For page-related queries, include more pages with lower threshold
       relevantPages = scored.filter((s) => s.item.type === "page").slice(0, 5);
       console.log(
-        `[Chat] Page query detected - including ${relevantPages.length} pages`
+        `[Chat] Page query detected - including ${relevantPages.length} pages:`
+      );
+      relevantPages.forEach((p) =>
+        console.log(`  - ${p.item.title} (score: ${p.score.toFixed(3)})`)
       );
     } else {
       relevantPages = scored
@@ -303,6 +306,12 @@ router.post("/chat", async (req, res) => {
     console.log(
       `[Chat] RAG: ${relevantProducts.length} products, ${relevantPages.length} pages`
     );
+    if (relevantPages.length > 0) {
+      console.log(`[Chat] Pages in context:`);
+      relevantPages.forEach((p) =>
+        console.log(`  - ${p.item.title} (score: ${p.score.toFixed(3)})`)
+      );
+    }
 
     // ========== BUILD PROMPT ==========
     const productTitles = [
@@ -398,6 +407,7 @@ router.post("/chat", async (req, res) => {
       debug: {
         products_in_context: relevantProducts.length,
         pages_in_context: relevantPages.length,
+        pages_found: relevantPages.map((p) => p.item.title),
         tags_found: taggedProductNames,
         products_matched: productCards.length,
       },
