@@ -15,6 +15,13 @@ const {
   embedTexts,
   cosineSimilarity,
 } = require("../services/embedding");
+
+// Anthropic Claude client
+const Anthropic = require("@anthropic-ai/sdk");
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Which AI to use - set via environment variable, default to Claude
+const AI_PROVIDER = process.env.AI_PROVIDER || "claude";
 const {
   getOrCreateConversation,
   saveConversationMessage,
@@ -328,39 +335,70 @@ router.post("/chat", async (req, res) => {
       storeProductSummary
     );
 
-    // Build messages array
-    const messages = [{ role: "system", content: systemPrompt }];
-
-    // Add history from frontend (current session only)
-    if (history && history.length > 0) {
-      history.forEach((turn) => {
-        messages.push({ role: turn.role, content: turn.content });
-      });
-    }
-
-    // Add current message
-    messages.push({ role: "user", content: message });
-
-    // Add product context
-    if (relevantProducts.length > 0 || relevantPages.length > 0) {
-      const contextMessage = buildContextMessage(
-        relevantProducts,
-        relevantPages
-      );
-      messages.push({ role: "system", content: contextMessage });
-    }
-
     // ========== CALL AI ==========
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages,
-      temperature: 0.7,
-      max_tokens: 500,
-    });
+    let rawAnswer;
 
-    const rawAnswer =
-      completion.choices[0]?.message?.content ||
-      "Sorry, I couldn't generate a response.";
+    if (AI_PROVIDER === "claude") {
+      // Claude API - system prompt is separate, combine with context
+      let fullSystemPrompt = systemPrompt;
+      if (relevantProducts.length > 0 || relevantPages.length > 0) {
+        const contextMessage = buildContextMessage(
+          relevantProducts,
+          relevantPages
+        );
+        fullSystemPrompt += "\n\n" + contextMessage;
+      }
+
+      // Build messages for Claude (no system messages in array)
+      const claudeMessages = [];
+      if (history && history.length > 0) {
+        history.forEach((turn) => {
+          claudeMessages.push({ role: turn.role, content: turn.content });
+        });
+      }
+      claudeMessages.push({ role: "user", content: message });
+
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        system: fullSystemPrompt,
+        messages: claudeMessages,
+      });
+
+      rawAnswer =
+        response.content[0]?.text || "Sorry, I couldn't generate a response.";
+      console.log(`[Chat] Claude response received`);
+    } else {
+      // OpenAI API
+      const messages = [{ role: "system", content: systemPrompt }];
+
+      if (history && history.length > 0) {
+        history.forEach((turn) => {
+          messages.push({ role: turn.role, content: turn.content });
+        });
+      }
+      messages.push({ role: "user", content: message });
+
+      if (relevantProducts.length > 0 || relevantPages.length > 0) {
+        const contextMessage = buildContextMessage(
+          relevantProducts,
+          relevantPages
+        );
+        messages.push({ role: "system", content: contextMessage });
+      }
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages,
+        temperature: 0.7,
+        max_tokens: 500,
+      });
+
+      rawAnswer =
+        completion.choices[0]?.message?.content ||
+        "Sorry, I couldn't generate a response.";
+      console.log(`[Chat] OpenAI response received`);
+    }
 
     // ========== EXTRACT PRODUCT TAGS ==========
     const tagMatches = rawAnswer.match(/\{\{([^}]+)\}\}/g) || [];
@@ -405,6 +443,7 @@ router.post("/chat", async (req, res) => {
       answer,
       product_cards: productCards,
       debug: {
+        ai_provider: AI_PROVIDER,
         products_in_context: relevantProducts.length,
         pages_in_context: relevantPages.length,
         pages_found: relevantPages.map((p) => p.item.title),
