@@ -301,8 +301,7 @@ router.post("/chat", async (req, res) => {
 
     const systemPrompt = buildSystemPrompt(
       storeData.storeName,
-      storeProductSummary,
-      language
+      storeProductSummary
     );
 
     // Build messages array
@@ -322,8 +321,7 @@ router.post("/chat", async (req, res) => {
     if (relevantProducts.length > 0 || relevantPages.length > 0) {
       const contextMessage = buildContextMessage(
         relevantProducts,
-        relevantPages,
-        language
+        relevantPages
       );
       messages.push({ role: "system", content: contextMessage });
     }
