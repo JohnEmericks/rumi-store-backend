@@ -281,9 +281,24 @@ router.post("/chat", async (req, res) => {
         .slice(0, 8);
     }
 
-    const relevantPages = scored
-      .filter((s) => s.item.type === "page" && s.score >= 0.3)
-      .slice(0, 2);
+    // Detect page/info related queries
+    const pageQuery =
+      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt/i.test(
+        message
+      );
+
+    let relevantPages;
+    if (pageQuery) {
+      // For page-related queries, include more pages with lower threshold
+      relevantPages = scored.filter((s) => s.item.type === "page").slice(0, 5);
+      console.log(
+        `[Chat] Page query detected - including ${relevantPages.length} pages`
+      );
+    } else {
+      relevantPages = scored
+        .filter((s) => s.item.type === "page" && s.score >= 0.25)
+        .slice(0, 3);
+    }
 
     console.log(
       `[Chat] RAG: ${relevantProducts.length} products, ${relevantPages.length} pages`
