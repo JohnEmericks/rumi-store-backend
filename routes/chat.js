@@ -290,16 +290,33 @@ router.post("/chat", async (req, res) => {
 
     // Detect page/info related queries
     const pageQuery =
-      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt|porto|skicka|skickas|kostar det|vad kostar|pris på frakt|kostnad|betalning|betala|payment|cost|price/i.test(
+      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt|porto|skicka|skickas|kostar det|vad kostar|pris på frakt|kostnad|betalning|betala|payment|cost|price|köpvillkor|terms/i.test(
         message
       );
 
+    // Keywords to match in page titles for shipping/policy questions
+    const policyKeywords =
+      /köpvillkor|villkor|frakt|leverans|shipping|policy|faq|retur|return|betalning|payment/i;
+
     let relevantPages;
     if (pageQuery) {
-      // For page-related queries, include more pages with lower threshold
-      relevantPages = scored.filter((s) => s.item.type === "page").slice(0, 5);
+      // First, find pages that match by title (most relevant for policy questions)
+      const titleMatchedPages = scored
+        .filter(
+          (s) => s.item.type === "page" && policyKeywords.test(s.item.title)
+        )
+        .slice(0, 3);
+
+      // Then add semantically matched pages
+      const semanticPages = scored
+        .filter(
+          (s) => s.item.type === "page" && !policyKeywords.test(s.item.title)
+        )
+        .slice(0, 2);
+
+      relevantPages = [...titleMatchedPages, ...semanticPages];
       console.log(
-        `[Chat] Page query detected - including ${relevantPages.length} pages:`
+        `[Chat] Page query detected - ${titleMatchedPages.length} title matches, ${semanticPages.length} semantic:`
       );
       relevantPages.forEach((p) =>
         console.log(`  - ${p.item.title} (score: ${p.score.toFixed(3)})`)
