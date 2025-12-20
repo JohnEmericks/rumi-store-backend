@@ -290,7 +290,7 @@ router.post("/chat", async (req, res) => {
 
     // Detect page/info related queries
     const pageQuery =
-      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt|porto|skicka|skickas|kostar det|vad kostar|pris på frakt/i.test(
+      /shipping|deliver|return|policy|about|contact|blog|article|info|faq|hur|villkor|frakt|leverans|retur|om oss|kontakt|porto|skicka|skickas|kostar det|vad kostar|pris på frakt|kostnad|betalning|betala|payment|cost|price/i.test(
         message
       );
 

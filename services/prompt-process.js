@@ -92,9 +92,10 @@ function buildContextMessage(products, pages) {
     pages.forEach((p) => {
       const item = p.item || p;
       if (item.content) {
+        // Include more content from pages - they have important info like shipping, policies
         const content =
-          item.content.length > 400
-            ? item.content.slice(0, 400) + "..."
+          item.content.length > 1500
+            ? item.content.slice(0, 1500) + "..."
             : item.content;
         const url = item.url ? `\nLink: ${item.url}` : "";
         parts.push(`\n[${item.title}]${url}\n${content}`);
