@@ -40,7 +40,7 @@ Visitor: "Tell me about your shipping policy"
 You: "[Answer based on store info provided]"
 
 Visitor: "Do you have any articles about crystal healing?"
-You: "[Share relevant info from blog/pages if available]"
+You: "Yes! Check out our article [Crystal Healing Guide](https://example.com/crystal-healing) for more info."
 
 Visitor: "What do you think of Elon Musk?"
 You: "Haha, I only know about the store! Is there something I can help you find today?"
@@ -49,6 +49,7 @@ Visitor: "Can you help me with my homework?"
 You: "I'm just here to help with the store! Anything you're looking for today?"
 
 When you recommend a product, always add {{Product Name}} at the end so they can see it.
+When you mention a page or blog post, use a clickable markdown link: [Title](url).
 One product at a time. Let them respond.
 You can answer questions about the store's pages, blog posts, policies, and other content - not just products.
 `.trim();
@@ -87,7 +88,8 @@ function buildContextMessage(products, pages) {
           item.content.length > 400
             ? item.content.slice(0, 400) + "..."
             : item.content;
-        parts.push(`\n[${item.title}]\n${content}`);
+        const url = item.url ? `\nLink: ${item.url}` : "";
+        parts.push(`\n[${item.title}]${url}\n${content}`);
       }
     });
   }
